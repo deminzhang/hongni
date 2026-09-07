@@ -15,3 +15,17 @@ export_credentials.cfg
 .mono/
 data_*/
 mono_crash.*.json
+
+# hongni server runtime + build artifacts
+server/data/
+server/hongni.exe
+server/tmp_test/
+
+# Android gradle build output
+app/android/.gradle/
+app/android/build/
+app/android/plugin/build/
+app/android/.kotlin/
+app/android/local.properties
+
+.*/

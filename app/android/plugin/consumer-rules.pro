@@ -1,0 +1,2 @@
+-keep class com.hongni.plugin.** { *; }
+-keep @org.godotengine.godot.plugin.UsedByGodot class * { *; }
