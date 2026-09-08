@@ -1,11 +1,15 @@
 package blob
 
 import (
+	"bufio"
+	"bytes"
 	"image"
 	"image/jpeg"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp" // register WebP decoder
@@ -29,18 +33,42 @@ func New(dataDir string) *Store {
 	}
 }
 
-func (s *Store) blobPath(hash string) string {
-	return filepath.Join(s.blobsDir, hash[0:2], hash[2:4], hash)
+func (s *Store) blobDir(hash string) string {
+	return filepath.Join(s.blobsDir, hash[0:2], hash[2:4])
 }
 
-func (s *Store) thumbPath(hash string) string {
-	return filepath.Join(s.thumbsDir, hash[0:2], hash[2:4], hash+".jpg")
+// blobPath returns the on-disk path for a blob with the given extension. The
+// extension is a pure function of the content (see extensionOfContent), so a
+// hash always maps to exactly one path even though it may be shared by many
+// assets — content addressing is preserved and deduplication stays intact.
+func (s *Store) blobPath(hash, ext string) string {
+	return filepath.Join(s.blobDir(hash), hash+"."+ext)
+}
+
+// resolveBlobPath locates the physical blob file for a hash. Blobs are
+// content-addressed and the extension is derived from content, so at most one
+// "<hash>.<ext>" file exists for a given hash. It also tolerates the legacy
+// bare "<hash>" layout so any un-migrated blob remains readable.
+func (s *Store) resolveBlobPath(hash string) (string, error) {
+	matches, err := filepath.Glob(filepath.Join(s.blobDir(hash), hash+".*"))
+	if err != nil {
+		return "", err
+	}
+	if len(matches) > 0 {
+		return matches[0], nil
+	}
+	return filepath.Join(s.blobDir(hash), hash), nil
 }
 
 // Put writes the blob content addressed by hash, atomically, skipping the
-// write if the file already exists (deduplication).
+// write if the file already exists (deduplication). The stored file is named
+// "<hash>.<ext>" where ext is derived from the content itself, so the hash
+// stays a stable, unique content address regardless of the visible extension.
 func (s *Store) Put(hash string, r io.Reader) error {
-	p := s.blobPath(hash)
+	br := bufio.NewReader(r)
+	head, _ := br.Peek(512)
+	p := s.blobPath(hash, extensionOfContent(head))
+
 	if _, err := os.Stat(p); err == nil {
 		return nil
 	}
@@ -52,7 +80,7 @@ func (s *Store) Put(hash string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, r); err != nil {
+	if _, err := io.Copy(f, br); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -66,7 +94,11 @@ func (s *Store) Put(hash string, r io.Reader) error {
 
 // Open returns a reader over the stored blob.
 func (s *Store) Open(hash string) (io.ReadCloser, error) {
-	return os.Open(s.blobPath(hash))
+	p, err := s.resolveBlobPath(hash)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(p)
 }
 
 // OpenThumb returns a reader over the stored thumbnail, if present.
@@ -76,12 +108,49 @@ func (s *Store) OpenThumb(hash string) (io.ReadCloser, error) {
 
 // Delete removes both the blob and its thumbnail, ignoring missing files.
 func (s *Store) Delete(hash string) error {
-	for _, p := range []string{s.blobPath(hash), s.thumbPath(hash)} {
+	bp, err := s.resolveBlobPath(hash)
+	if err != nil {
+		return err
+	}
+	for _, p := range []string{bp, s.thumbPath(hash)} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Store) thumbPath(hash string) string {
+	return filepath.Join(s.thumbsDir, hash[0:2], hash[2:4], hash+".jpg")
+}
+
+// MigrateLegacyBlobs renames legacy blob files stored as bare "<hash>" (no
+// extension) to "<hash>.<ext>" using the content-derived extension. It is
+// idempotent: files already named "<hash>.<ext>" are skipped. Only blobs/
+// (sharded two levels deep) is examined; thumbnails are untouched.
+func (s *Store) MigrateLegacyBlobs() error {
+	return filepath.WalkDir(s.blobsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		base := filepath.Base(path)
+		// Legacy blobs are 64-hex-char names with no dot.
+		if len(base) != 64 || strings.ContainsAny(base, ".") {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		head := make([]byte, 512)
+		n, _ := io.ReadFull(f, head)
+		f.Close()
+		ext := extensionOfContent(head[:n])
+		return os.Rename(path, filepath.Join(filepath.Dir(path), base+"."+ext))
+	})
 }
 
 // EnsureThumb decodes r once and, when decodable, writes a max-512px JPEG
@@ -123,6 +192,52 @@ func Dimensions(r io.Reader) (int, int, bool) {
 	}
 	return cfg.Width, cfg.Height, true
 }
+
+// extensionOfContent derives a file extension from the leading bytes of the
+// content. It is a pure function of the bytes, so identical content always
+// yields the same extension and deduplication by hash stays intact. Unknown
+// formats fall back to "bin" so every blob still carries a visible extension
+// and remains identifiable on disk without relying on the database or tools.
+func extensionOfContent(b []byte) string {
+	switch {
+	case len(b) >= 8 && bytes.Equal(b[:8], pngSig):
+		return "png"
+	case len(b) >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff:
+		return "jpg"
+	case len(b) >= 4 && bytes.Equal(b[:4], []byte("GIF8")):
+		return "gif"
+	case len(b) >= 12 && bytes.Equal(b[:4], []byte("RIFF")) && bytes.Equal(b[8:12], []byte("WEBP")):
+		return "webp"
+	case len(b) >= 2 && b[0] == 'B' && b[1] == 'M':
+		return "bmp"
+	case len(b) >= 12 && bytes.Equal(b[4:8], bmffSig):
+		switch brand := b[8:12]; {
+		case bytes.Equal(brand, []byte("heic")),
+			bytes.Equal(brand, []byte("heix")),
+			bytes.Equal(brand, []byte("hevc")),
+			bytes.Equal(brand, []byte("hevx")),
+			bytes.Equal(brand, []byte("mif1")),
+			bytes.Equal(brand, []byte("msf1")):
+			return "heic"
+		case bytes.Equal(brand, []byte("qt  ")):
+			return "mov"
+		default:
+			return "mp4"
+		}
+	case len(b) >= 4 && bytes.Equal(b[:4], ebmlSig):
+		return "mkv"
+	case len(b) >= 12 && bytes.Equal(b[:4], []byte("RIFF")) && bytes.Equal(b[8:12], []byte("AVI ")):
+		return "avi"
+	default:
+		return "bin"
+	}
+}
+
+var (
+	pngSig  = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+	bmffSig = []byte("ftyp")
+	ebmlSig = []byte{0x1a, 0x45, 0xdf, 0xa3}
+)
 
 func scaleDown(src image.Image, max int) image.Image {
 	b := src.Bounds()

@@ -31,6 +31,10 @@ func main() {
 	}
 	defer st.Close()
 	bl := blob.New(cfg.DataDir)
+	// Add the content-derived extension to legacy extension-less blobs (idempotent).
+	if err := bl.MigrateLegacyBlobs(); err != nil {
+		log.Printf("blob migration: %v", err)
+	}
 	handler := api.New(st, bl, cfg)
 
 	srv := &http.Server{
