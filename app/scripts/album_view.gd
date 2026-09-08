@@ -248,6 +248,9 @@ func _add_cell(a: Dictionary, index: int, gen: int) -> void:
 	# 只存云(本地无原件)→ 云下载角标;两端都有则不标。
 	if not _has_local_original(asset_id, str(a.get("original_name", "")), str(a.get("ext", ""))):
 		_add_badge(btn, "↓")
+	# 视频无服务端缩略图(解码不支持),用左上角 ▶ 标记,便于在网格中识别。
+	if str(a.get("media_type", "image")) == "video":
+		_add_badge(btn, "▶", Vector2(2, 2))
 	_load_cell_thumb(btn, asset_id, gen)
 
 
@@ -319,8 +322,9 @@ func _has_local_original(asset_id: int, name: String, ext: String = "") -> bool:
 	return false
 
 
-## Overlays a small right-top badge (cloud download ⇩ / upload ⇧) on a cell.
-func _add_badge(btn: Control, text: String) -> void:
+## Overlays a small corner badge (cloud download ⇩ / upload ⇧ at top-right,
+## video ▶ at top-left) on a cell.
+func _add_badge(btn: Control, text: String, pos: Vector2 = Vector2(THUMB_SIZE - 30, 2)) -> void:
 	var badge := Label.new()
 	badge.text = text
 	badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -330,7 +334,7 @@ func _add_badge(btn: Control, text: String) -> void:
 	sb.bg_color = Color(0, 0, 0, 0.5)
 	sb.set_corner_radius_all(4)
 	badge.add_theme_stylebox_override("normal", sb)
-	badge.position = Vector2(THUMB_SIZE - 30, 2)
+	badge.position = pos
 	btn.add_child(badge)
 
 

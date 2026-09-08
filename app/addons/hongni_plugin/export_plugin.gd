@@ -24,8 +24,8 @@ class AndroidExportPlugin extends EditorExportPlugin:
 
 	func _get_android_libraries(platform, debug):
 		if debug:
-			return PackedStringArray(["hongni_plugin/bin/hongni-plugin-debug.aar"])
-		return PackedStringArray(["hongni_plugin/bin/hongni-plugin-release.aar"])
+			return PackedStringArray(["res://addons/hongni_plugin/bin/hongni-plugin-debug.aar"])
+		return PackedStringArray(["res://addons/hongni_plugin/bin/hongni-plugin-release.aar"])
 
 	func _get_android_dependencies(platform, debug):
 		return PackedStringArray([

@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -15,6 +16,16 @@
         <meta-data
             android:name="org.godotengine.plugin.v2.HongniPlugin"
             android:value="com.hongni.plugin.HongniPlugin" />
+
+        <provider
+            android:name="com.hongni.plugin.HongniFileProvider"
+            android:authorities="${applicationId}.hongni.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/hongni_provider_paths" />
+        </provider>
     </application>
 
 </manifest>

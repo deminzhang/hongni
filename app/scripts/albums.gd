@@ -5,6 +5,8 @@ extends Control
 ## photo-grid screen); long-press a card for the album menu (rename/delete).
 ## The 散照 bucket is retained in the data layer only: it is folded into the
 ## 全部 card (a trunk aggregation) and never shown as a standalone card.
+## The trunk is switched via the top-bar 相册 button and the ⋮ menu's 隐私相册
+## entry (PIN-gated); switching back is done by tapping 相册.
 
 const LONG_PRESS := 0.5
 const TRUNK_ALBUM := "相册"
@@ -16,12 +18,11 @@ const TRUNK_COLUMNS := 2
 const CARD_SIZE := Vector2(336, 322)
 
 enum MenuId { RENAME, DELETE_ALBUM }
-enum MoreId { TRASH, SYNC, SETTINGS }
+enum MoreId { PRIVATE, TRASH, SYNC, SETTINGS }
 
 var card_grid: GridContainer
 var progress: ProgressBar
 var btn_trunk_album: Button
-var btn_trunk_private: Button
 var status_label: Label
 var ctx_menu: PopupMenu
 var more_menu: PopupMenu
@@ -62,27 +63,13 @@ func _build_ui() -> void:
 	title.add_theme_font_size_override("font_size", 22)
 	top.add_child(title)
 
-	# Trunk switcher (相册/隐私) moved to the top row, beside the other controls.
-	var group := ButtonGroup.new()
+	# Trunk switch button (相册) in the top bar; 隐私 lives in the ⋮ menu.
 	btn_trunk_album = Button.new()
 	btn_trunk_album.text = TRUNK_ALBUM
 	btn_trunk_album.toggle_mode = true
 	btn_trunk_album.button_pressed = true
-	btn_trunk_album.button_group = group
 	btn_trunk_album.pressed.connect(_on_trunk.bind(TRUNK_ALBUM))
 	top.add_child(btn_trunk_album)
-
-	btn_trunk_private = Button.new()
-	btn_trunk_private.text = TRUNK_PRIVATE
-	btn_trunk_private.toggle_mode = true
-	btn_trunk_private.button_group = group
-	btn_trunk_private.pressed.connect(_on_trunk.bind(TRUNK_PRIVATE))
-	top.add_child(btn_trunk_private)
-
-	var btn_new := Button.new()
-	btn_new.text = "新建相册"
-	btn_new.pressed.connect(_new_album)
-	top.add_child(btn_new)
 
 	var btn_system := Button.new()
 	btn_system.text = "系统相册"
@@ -93,7 +80,15 @@ func _build_ui() -> void:
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	top.add_child(spacer)
 
-	# "更多" (four-dot ⋮) dropdown: 最近删除 / 立即同步 / 设置.
+	# "新建相册" rendered as a compact "+" square, just left of the ⋮ menu.
+	var btn_new := Button.new()
+	btn_new.text = "+"
+	btn_new.focus_mode = Control.FOCUS_NONE
+	btn_new.custom_minimum_size = Vector2(44, 44)
+	btn_new.pressed.connect(_new_album)
+	top.add_child(btn_new)
+
+	# "更多" (four-dot ⋮) dropdown: 隐私相册 / 最近删除 / 立即同步 / 设置.
 	var more_btn := Button.new()
 	more_btn.text = "⋮"
 	more_btn.focus_mode = Control.FOCUS_NONE
@@ -132,6 +127,7 @@ func _build_ui() -> void:
 	more_menu = PopupMenu.new()
 	add_child(more_menu)
 	more_menu.id_pressed.connect(_on_more_menu)
+	more_menu.add_item("隐私相册", MoreId.PRIVATE)
 	more_menu.add_item("最近删除", MoreId.TRASH)
 	more_menu.add_item("立即同步", MoreId.SYNC)
 	more_menu.add_item("设置", MoreId.SETTINGS)
@@ -190,12 +186,22 @@ func _open_album(album_id: int, name: String) -> void:
 
 func _on_trunk(name: String) -> void:
 	if name == current_trunk:
+		# Re-tapping the active trunk just re-syncs the toggle state.
+		btn_trunk_album.button_pressed = true
 		return
 	if name == TRUNK_PRIVATE and not await Lock.require_unlock():
 		btn_trunk_album.button_pressed = true
 		return
 	current_trunk = name
+	_sync_trunk_state()
 	_reload_context.call_deferred()
+
+
+## Reflects the active trunk on the top-bar 相册 toggle: pressed only while the
+## 相册 trunk is active. 隐私 is entered from the ⋮ menu, so the toggle reads as
+## released there but stays the way back to 相册.
+func _sync_trunk_state() -> void:
+	btn_trunk_album.button_pressed = current_trunk == TRUNK_ALBUM
 
 
 func _reload_context() -> void:
@@ -427,6 +433,8 @@ func _show_more_menu() -> void:
 
 func _on_more_menu(id: int) -> void:
 	match id:
+		MoreId.PRIVATE:
+			await _on_trunk(TRUNK_PRIVATE)
 		MoreId.TRASH:
 			_open_trash()
 		MoreId.SYNC:

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Godot's user:// maps to Context.getFilesDir() on Android, so the internal
+  files/ tree (including cache/originals, where cloud videos are downloaded
+  before external playback) can be shared with external video players via the
+  FileProvider declared in AndroidManifest.xml.
+-->
+<paths>
+    <files-path name="user_files" path="." />
+</paths>

@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.CancellationSignal
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.core.content.FileProvider
 import org.godotengine.godot.Godot
 import org.godotengine.godot.plugin.GodotPlugin
 import org.godotengine.godot.plugin.SignalInfo
@@ -151,28 +152,33 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
         }
         val afterId = after_cursor.toLongOrNull() ?: 0L
         val sort = "${MediaStore.MediaColumns.DATE_TAKEN} DESC"
-        for (uri in uris) {
-            val selection = if (afterId > 0) "${MediaStore.MediaColumns._ID} > ?" else null
-            val selArgs = if (afterId > 0) arrayOf(afterId.toString()) else null
-            activity.contentResolver.query(uri, projection, selection, selArgs, sort)?.use { c ->
-                val idIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-                val nameIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-                val mimeIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
-                val takenIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_TAKEN)
-                val sizeIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
-                while (c.moveToNext() && items.length() < 1000) {
-                    val id = c.getLong(idIdx)
-                    val contentUri = uri.buildUpon().appendPath(id.toString()).build().toString()
-                    val o = JSONObject()
-                    o.put("id", id)
-                    o.put("uri", contentUri)
-                    o.put("display_name", c.getString(nameIdx) ?: "")
-                    o.put("mime_type", c.getString(mimeIdx) ?: "")
-                    o.put("taken_at", c.getLong(takenIdx) / 1000L)
-                    o.put("size", c.getLong(sizeIdx))
-                    items.put(o)
+        try {
+            for (uri in uris) {
+                val selection = if (afterId > 0) "${MediaStore.MediaColumns._ID} > ?" else null
+                val selArgs = if (afterId > 0) arrayOf(afterId.toString()) else null
+                activity.contentResolver.query(uri, projection, selection, selArgs, sort)?.use { c ->
+                    val idIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                    val nameIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                    val mimeIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+                    val takenIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_TAKEN)
+                    val sizeIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                    while (c.moveToNext() && items.length() < 1000) {
+                        val id = c.getLong(idIdx)
+                        val contentUri = uri.buildUpon().appendPath(id.toString()).build().toString()
+                        val o = JSONObject()
+                        o.put("id", id)
+                        o.put("uri", contentUri)
+                        o.put("display_name", c.getString(nameIdx) ?: "")
+                        o.put("mime_type", c.getString(mimeIdx) ?: "")
+                        o.put("taken_at", c.getLong(takenIdx) / 1000L)
+                        o.put("size", c.getLong(sizeIdx))
+                        items.put(o)
+                    }
                 }
             }
+        } catch (e: SecurityException) {
+            // Access revoked/between permission checks — return whatever was
+            // gathered rather than crashing the Godot bridge.
         }
         return items.toString()
     }
@@ -314,18 +320,21 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     // --- Video playback ---
 
     @UsedByGodot
-    fun play_video(uriStr: String) {
+    fun play_video(uriOrPath: String) {
         val activity = getActivity() ?: return
         runOnUiThread {
+            val uri = toPlayableVideoUri(activity, uriOrPath)
             val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(Uri.parse(uriStr), "video/*")
+                setDataAndType(uri, "video/*")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             try {
                 activity.startActivity(intent)
             } catch (e: Exception) {
                 // No handler for video/* — fall back to any viewer.
-                val fallback = Intent(Intent.ACTION_VIEW, Uri.parse(uriStr))
+                val fallback = Intent(Intent.ACTION_VIEW, uri).apply {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
                 try {
                     activity.startActivity(fallback)
                 } catch (e2: Exception) {
@@ -333,6 +342,27 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                 }
             }
         }
+    }
+
+    /**
+     * A cloud video is downloaded into the app-internal cache and passed here as
+     * an absolute path, but external players cannot read another app's file
+     * paths (FileUriExposedException on API 24+). A bare absolute path is
+     * exposed as a content:// URI through the FileProvider below. Real URIs
+     * (content://, http(s)://, file://) are kept as-is.
+     */
+    private fun toPlayableVideoUri(activity: Activity, uriOrPath: String): Uri {
+        val parsed = Uri.parse(uriOrPath)
+        if (parsed.scheme != null) return parsed
+        val file = File(uriOrPath)
+        if (file.isFile) {
+            return FileProvider.getUriForFile(
+                activity,
+                activity.packageName + ".hongni.files",
+                file,
+            )
+        }
+        return parsed
     }
 
     // --- mDNS LAN discovery (_hongni._tcp) ---
@@ -387,19 +417,35 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     // --- helpers ---
 
     private fun ensureMediaPermission(activity: Activity): Boolean {
-        val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Full media access OR Android 14+ partial ("selected photos") access
+            // both satisfy reading MediaStore for the system-album browse.
+            val full = arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+            )
+            val hasFull = full.all {
+                activity.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+            }
+            val hasPartial = activity.checkSelfPermission(
+                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (hasFull || hasPartial) return true
+            runOnUiThread {
+                activity.requestPermissions(full, REQ_PERMISSIONS)
+            }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-        } else {
-            return true
-        }
-        val missing = perms.filter {
-            activity.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
-        }
-        if (missing.isEmpty()) return true
-        runOnUiThread {
-            activity.requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
+            if (activity.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) ==
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                return true
+            }
+            runOnUiThread {
+                activity.requestPermissions(
+                    arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE),
+                    REQ_PERMISSIONS,
+                )
+            }
         }
         // Best-effort: permissions are granted asynchronously; return true and
         // let the caller retry on next scan if still missing.

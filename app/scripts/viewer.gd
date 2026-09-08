@@ -1,12 +1,20 @@
 extends Control
-## Full-screen viewer: shows the original image for the current asset, with
-## left/right navigation and delete / add-to-album / save-to-device-gallery
+## Full-screen viewer: shows the original image for the current asset (or a
+## poster for videos, which are played by an external player), with left/right
+## swipe navigation and delete / add-to-album / save-to-device-gallery / play
 ## actions.
+
+const SWIPE_THRESHOLD := 80.0
 
 var texture_rect: TextureRect
 var label_name: Label
 var label_status: Label
 var btn_save: Button
+var btn_play: Button
+
+# Horizontal drag/swipe state for prev/next photo navigation.
+var _touch_active := false
+var _touch_start := Vector2.ZERO
 
 
 func _ready() -> void:
@@ -17,9 +25,12 @@ func _ready() -> void:
 func _build_ui() -> void:
 	var root := VBoxContainer.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	# Swipes starting anywhere except buttons must reach _gui_input below.
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(root)
 
 	var top := HBoxContainer.new()
+	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(top)
 
 	var btn_back := Button.new()
@@ -39,6 +50,7 @@ func _build_ui() -> void:
 
 	var spacer := Control.new()
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	spacer.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	top.add_child(spacer)
 
 	var btn_delete := Button.new()
@@ -51,12 +63,19 @@ func _build_ui() -> void:
 	btn_album.pressed.connect(_add_to_album)
 	top.add_child(btn_album)
 
+	btn_play = Button.new()
+	btn_play.text = "播放"
+	btn_play.visible = false
+	btn_play.pressed.connect(_play_video)
+	top.add_child(btn_play)
+
 	btn_save = Button.new()
 	btn_save.text = "存到相册"
 	btn_save.pressed.connect(_save_to_album)
 	top.add_child(btn_save)
 
 	label_name = Label.new()
+	label_name.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(label_name)
 
 	texture_rect = TextureRect.new()
@@ -64,10 +83,12 @@ func _build_ui() -> void:
 	texture_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	texture_rect.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	texture_rect.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	texture_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(texture_rect)
 
 	label_status = Label.new()
 	label_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	label_status.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(label_status)
 
 
@@ -92,11 +113,20 @@ func _show_current() -> void:
 	label_name.text = "%d  %s" % [asset_id, name]
 	texture_rect.texture = null
 	Cache.mark_viewed(asset_id)
+	btn_play.visible = media_type == "video"
 	btn_save.visible = OS.get_name() == "Android" and media_type != "video"
 	label_status.text = "加载中…"
 
 	if media_type == "video":
-		label_status.text = "视频暂不支持内嵌预览"
+		# Godot has no built-in mp4 decoder, so videos are played by an external
+		# player via the plugin (Android) or the OS default app (desktop). Show a
+		# cached poster when one exists, else just the play affordance.
+		label_status.text = "视频 · 点击「播放」打开播放器"
+		var poster := Cache.read_thumb(asset_id)
+		if poster.size() > 0:
+			var pimg := Image.new()
+			if pimg.load_jpg_from_buffer(poster) == OK:
+				texture_rect.texture = ImageTexture.create_from_image(pimg)
 		return
 
 	# Prefer the cached full-res copy (works offline); otherwise fetch from the
@@ -134,6 +164,48 @@ func _show_current() -> void:
 		label_status.text = "缓存无法解码"
 	else:
 		label_status.text = "格式不支持预览"
+
+
+## Swipe left/right (touch or mouse drag) to go to the next/previous photo.
+## Swipes over buttons are consumed by the buttons themselves and never reach
+## here; the image/label fillers are MOUSE_FILTER_IGNORE so gestures starting
+## on the photo area land on this control instead.
+func _gui_input(event: InputEvent) -> void:
+	if event is InputEventScreenTouch:
+		if event.pressed:
+			_touch_active = true
+			_touch_start = event.position
+		else:
+			if _touch_active:
+				_handle_swipe_end(event.position)
+			_touch_active = false
+		accept_event()
+	elif event is InputEventScreenDrag:
+		if _touch_active:
+			accept_event()
+	elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
+		if event.pressed:
+			_touch_active = true
+			_touch_start = event.position
+		else:
+			if _touch_active:
+				_handle_swipe_end(event.position)
+			_touch_active = false
+		accept_event()
+	elif event is InputEventMouseMotion and _touch_active and (event.buttons & MOUSE_BUTTON_MASK_LEFT):
+		accept_event()
+
+
+## Maps a just-released drag to prev/next, ignoring short or vertical swipes.
+func _handle_swipe_end(pos: Vector2) -> void:
+	var dx := pos.x - _touch_start.x
+	var dy := pos.y - _touch_start.y
+	if abs(dx) < SWIPE_THRESHOLD or abs(dy) > abs(dx):
+		return
+	if dx < 0:
+		_next()
+	else:
+		_prev()
 
 
 func _prev() -> void:
@@ -194,6 +266,43 @@ func _ext_for_mime(mime: String) -> String:
 		"image/gif": return "gif"
 		"image/bmp": return "bmp"
 		_: return "jpg"
+
+
+## Plays the current video. The mp4 is served by the cloud behind a Bearer
+## token, which an external player cannot send, so it is downloaded to the local
+## original cache first (reusing a cached copy when present) and then handed to
+## the device's external player: the Android plugin (content:// via FileProvider)
+## or the OS default app on desktop.
+func _play_video() -> void:
+	var a: Dictionary = Api.viewer_assets[Api.viewer_index]
+	var asset_id := int(a.get("id", 0))
+	if asset_id <= 0:
+		label_status.text = "本地视频尚未上传云端，无法播放"
+		return
+	var name := str(a.get("original_name", ""))
+	var ext := str(a.get("ext", ""))
+	if ext == "":
+		ext = name.get_extension().to_lower()
+	if ext == "":
+		ext = "mp4"
+	var body := Cache.read_original(asset_id, name, ext)
+	if body.is_empty():
+		label_status.text = "正在获取视频…"
+		var r: Dictionary = await Api.fetch_original(asset_id)
+		if r.has("error"):
+			label_status.text = "离线且视频未缓存，无法播放"
+			return
+		body = r["body"]
+		Cache.save_original(asset_id, name, body, ext)
+	if body.is_empty():
+		label_status.text = "播放失败：无数据"
+		return
+	var path := Cache.original_path(asset_id, name, ext)
+	if not FileAccess.file_exists(path):
+		label_status.text = "播放失败：本地文件缺失"
+		return
+	label_status.text = ""
+	Lock.play_video(ProjectSettings.globalize_path(path))
 
 
 ## Saves the current image's full-res bytes into the device system album

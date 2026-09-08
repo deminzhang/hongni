@@ -116,7 +116,8 @@ func _prompt_pin() -> bool:
 	dialog.confirmed.connect(func() -> void: _pin_prompt_submitted.emit(edit.text))
 	dialog.popup_centered()
 	var text: String = await _pin_prompt_submitted
-	dialog.queue_free()
+	if is_instance_valid(dialog):
+		dialog.queue_free()
 	return unlock_with_pin(text)
 
 
@@ -160,9 +161,12 @@ func save_to_gallery(src_abs_path: String, display_name: String, mime_type: Stri
 	return _plugin().save_to_gallery(src_abs_path, display_name, mime_type)
 
 
-func play_video(uri: String) -> void:
+func play_video(path_or_uri: String) -> void:
 	if _has_plugin():
-		_plugin().play_video(uri)
+		_plugin().play_video(path_or_uri)
+	else:
+		# Desktop/editor: no plugin, open the file with the OS default app.
+		OS.shell_open(path_or_uri)
 
 
 func open_photo_picker() -> void:
