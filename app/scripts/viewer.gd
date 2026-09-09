@@ -5,20 +5,32 @@ extends Control
 ## actions.
 
 const SWIPE_THRESHOLD := 80.0
+# In-app MediaPlayer frames are captured at this size and scaled to fit.
+const VIDEO_FRAME_W := 640
+const VIDEO_FRAME_H := 360
+const FRAME_POLL_MS := 0.033
 
 var texture_rect: TextureRect
 var label_name: Label
 var label_status: Label
 var btn_save: Button
-var btn_play: Button
+var btn_center_play: Button
 
 # Horizontal drag/swipe state for prev/next photo navigation.
 var _touch_active := false
 var _touch_start := Vector2.ZERO
+var _touch_time := 0
+
+# In-app video playback state (Android plugin renders frames into texture_rect).
+var _inapp_active := false
+var _inapp_paused := false
+var _frame_accum := 0.0
 
 
 func _ready() -> void:
 	_build_ui()
+	if not Lock.inapp_video_closed.is_connected(_on_inapp_closed):
+		Lock.inapp_video_closed.connect(_on_inapp_closed)
 	_show_current()
 
 
@@ -63,16 +75,21 @@ func _build_ui() -> void:
 	btn_album.pressed.connect(_add_to_album)
 	top.add_child(btn_album)
 
-	btn_play = Button.new()
-	btn_play.text = "播放"
-	btn_play.visible = false
-	btn_play.pressed.connect(_play_video)
-	top.add_child(btn_play)
-
 	btn_save = Button.new()
 	btn_save.text = "存到相册"
 	btn_save.pressed.connect(_save_to_album)
 	top.add_child(btn_save)
+
+	# Big center ▶ over the video; visible when paused/not started, hidden while
+	# in-app playback runs. Clicking the video area toggles play/pause.
+	btn_center_play = Button.new()
+	btn_center_play.text = "▶"
+	btn_center_play.add_theme_font_size_override("font_size", 64)
+	btn_center_play.custom_minimum_size = Vector2(96, 96)
+	btn_center_play.visible = false
+	btn_center_play.pressed.connect(_on_center_play)
+	add_child(btn_center_play)
+	btn_center_play.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
 
 	label_name = Label.new()
 	label_name.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -93,6 +110,7 @@ func _build_ui() -> void:
 
 
 func _show_current() -> void:
+	_stop_inapp()
 	if Api.viewer_assets.is_empty() or Api.viewer_index < 0 or Api.viewer_index >= Api.viewer_assets.size():
 		texture_rect.texture = null
 		label_name.text = "（无）"
@@ -113,20 +131,24 @@ func _show_current() -> void:
 	label_name.text = "%d  %s" % [asset_id, name]
 	texture_rect.texture = null
 	Cache.mark_viewed(asset_id)
-	btn_play.visible = media_type == "video"
 	btn_save.visible = OS.get_name() == "Android" and media_type != "video"
 	label_status.text = "加载中…"
 
 	if media_type == "video":
-		# Godot has no built-in mp4 decoder, so videos are played by an external
-		# player via the plugin (Android) or the OS default app (desktop). Show a
-		# cached poster when one exists, else just the play affordance.
-		label_status.text = "视频 · 点击「播放」打开播放器"
+		label_status.text = "视频"
+		# Poster when the server (or Android MediaStore) produced a thumbnail for
+		# this asset; otherwise the in-app frame appears once playback starts.
 		var poster := Cache.read_thumb(asset_id)
 		if poster.size() > 0:
 			var pimg := Image.new()
 			if pimg.load_jpg_from_buffer(poster) == OK:
 				texture_rect.texture = ImageTexture.create_from_image(pimg)
+		else:
+			texture_rect.texture = null
+		# Auto-play in-app on Android; desktop shows ▶ that launches the OS player.
+		_show_center_play(true)
+		if OS.get_name() == "Android":
+			_start_inapp()
 		return
 
 	# Prefer the cached full-res copy (works offline); otherwise fetch from the
@@ -175,9 +197,13 @@ func _gui_input(event: InputEvent) -> void:
 		if event.pressed:
 			_touch_active = true
 			_touch_start = event.position
+			_touch_time = Time.get_ticks_msec()
 		else:
 			if _touch_active:
-				_handle_swipe_end(event.position)
+				if _on_tap(event.position):
+					pass
+				else:
+					_handle_swipe_end(event.position)
 			_touch_active = false
 		accept_event()
 	elif event is InputEventScreenDrag:
@@ -187,13 +213,33 @@ func _gui_input(event: InputEvent) -> void:
 		if event.pressed:
 			_touch_active = true
 			_touch_start = event.position
+			_touch_time = Time.get_ticks_msec()
 		else:
 			if _touch_active:
-				_handle_swipe_end(event.position)
+				if not _on_tap(event.position):
+					_handle_swipe_end(event.position)
 			_touch_active = false
 		accept_event()
 	elif event is InputEventMouseMotion and _touch_active and (event.buttons & MOUSE_BUTTON_MASK_LEFT):
 		accept_event()
+
+
+## A short press that doesn't move becomes a tap: for a video it toggles
+## play/pause (the "click the whole playback area to pause" behaviour). Returns
+## true when the tap was consumed here, false when it should fall through to a
+## swipe-based navigation.
+func _on_tap(pos: Vector2) -> bool:
+	var dx := pos.x - _touch_start.x
+	var dy := pos.y - _touch_start.y
+	if abs(dx) >= 24.0 or abs(dy) >= 24.0 or (Time.get_ticks_msec() - _touch_time) >= 400:
+		return false
+	if Api.viewer_assets.is_empty() or Api.viewer_index < 0 or Api.viewer_index >= Api.viewer_assets.size():
+		return false
+	var a: Dictionary = Api.viewer_assets[Api.viewer_index]
+	if str(a.get("media_type", "image")) != "video":
+		return false
+	_toggle_video_pause()
+	return true
 
 
 ## Maps a just-released drag to prev/next, ignoring short or vertical swipes.
@@ -268,17 +314,16 @@ func _ext_for_mime(mime: String) -> String:
 		_: return "jpg"
 
 
-## Plays the current video. The mp4 is served by the cloud behind a Bearer
-## token, which an external player cannot send, so it is downloaded to the local
-## original cache first (reusing a cached copy when present) and then handed to
-## the device's external player: the Android plugin (content:// via FileProvider)
-## or the OS default app on desktop.
-func _play_video() -> void:
+## The mp4 is served by the cloud behind a Bearer token, so it is downloaded to
+## the local original cache first (reusing a cached copy when present) and then
+## handed to playback: the Android in-app MediaPlayer via the plugin (or the OS
+## player on desktop/editor). Returns the absolute local path, "" on failure.
+func _ensure_local_video() -> String:
 	var a: Dictionary = Api.viewer_assets[Api.viewer_index]
 	var asset_id := int(a.get("id", 0))
 	if asset_id <= 0:
 		label_status.text = "本地视频尚未上传云端，无法播放"
-		return
+		return ""
 	var name := str(a.get("original_name", ""))
 	var ext := str(a.get("ext", ""))
 	if ext == "":
@@ -291,18 +336,96 @@ func _play_video() -> void:
 		var r: Dictionary = await Api.fetch_original(asset_id)
 		if r.has("error"):
 			label_status.text = "离线且视频未缓存，无法播放"
-			return
+			return ""
 		body = r["body"]
 		Cache.save_original(asset_id, name, body, ext)
 	if body.is_empty():
 		label_status.text = "播放失败：无数据"
-		return
+		return ""
 	var path := Cache.original_path(asset_id, name, ext)
 	if not FileAccess.file_exists(path):
 		label_status.text = "播放失败：本地文件缺失"
+		return ""
+	return path
+
+
+## Auto-play on open: starts the Android plugin's in-app MediaPlayer player;
+## falls back to the OS player (editor/desktop) when the plugin is unavailable.
+func _start_inapp() -> void:
+	var path := await _ensure_local_video()
+	if path == "":
+		return
+	if Lock.start_inapp_video(ProjectSettings.globalize_path(path), VIDEO_FRAME_W, VIDEO_FRAME_H):
+		_inapp_active = true
+		_inapp_paused = false
+		_frame_accum = 0.0
+		_show_center_play(false)
+		label_status.text = ""
+	else:
+		label_status.text = ""
+		Lock.play_video(ProjectSettings.globalize_path(path))
+
+
+func _start_video_external() -> void:
+	var path := await _ensure_local_video()
+	if path == "":
 		return
 	label_status.text = ""
 	Lock.play_video(ProjectSettings.globalize_path(path))
+
+
+func _toggle_video_pause() -> void:
+	if _inapp_active:
+		if _inapp_paused:
+			Lock.resume_inapp_video()
+			_inapp_paused = false
+			_show_center_play(false)
+		else:
+			Lock.pause_inapp_video()
+			_inapp_paused = true
+			_show_center_play(true)
+	else:
+		_start_video_external()
+
+
+func _on_center_play() -> void:
+	_toggle_video_pause()
+
+
+## The plugin finished/errored: drop in-app state and restore the ▶ affordance.
+func _on_inapp_closed() -> void:
+	_inapp_active = false
+	_inapp_paused = false
+	_show_center_play(true)
+	label_status.text = "视频"
+
+
+func _stop_inapp() -> void:
+	if _inapp_active:
+		Lock.stop_inapp_video()
+		_inapp_active = false
+	_inapp_paused = false
+	_frame_accum = 0.0
+
+
+func _show_center_play(show: bool) -> void:
+	btn_center_play.visible = show
+
+
+## Polls the plugin's latest decoded frame and paints it into texture_rect.
+func _process(delta: float) -> void:
+	if not _inapp_active or _inapp_paused:
+		return
+	_frame_accum += delta
+	if _frame_accum < FRAME_POLL_MS:
+		return
+	_frame_accum = 0.0
+	var body := Lock.grab_inapp_frame()
+	if body.is_empty():
+		return
+	var img := Image.create_from_data(VIDEO_FRAME_W, VIDEO_FRAME_H, false, Image.FORMAT_RGBA8, body)
+	if img != null:
+		texture_rect.texture = ImageTexture.create_from_image(img)
 
 
 ## Saves the current image's full-res bytes into the device system album
@@ -362,4 +485,9 @@ func _save_to_album() -> void:
 
 
 func _go_back() -> void:
+	_stop_inapp()
 	get_tree().change_scene_to_file("res://scenes/album_view.tscn")
+
+
+func _exit_tree() -> void:
+	_stop_inapp()

@@ -6,8 +6,13 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.SurfaceTexture
 import android.hardware.biometrics.BiometricManager
 import android.hardware.biometrics.BiometricPrompt
+import android.media.MediaMetadataRetriever
+import android.media.MediaPlayer
 import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -15,6 +20,12 @@ import android.os.Build
 import android.os.CancellationSignal
 import android.os.Environment
 import android.provider.MediaStore
+import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
+import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import androidx.core.content.FileProvider
 import org.godotengine.godot.Godot
 import org.godotengine.godot.plugin.GodotPlugin
@@ -24,12 +35,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Godot Android plugin (v2) singleton "HongniPlugin". Exposes biometric
@@ -56,7 +70,19 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
         SignalInfo("photo_picker_result", String::class.java),
         SignalInfo("lan_scan_result", String::class.java),
         SignalInfo("backup_pending"),
+        SignalInfo("inapp_video_closed"),
     )
+
+    // In-app video playback (MediaPlayer + TextureView frame bridge). The
+    // TextureView is a tiny 1x1 view attached to the activity so the decode
+    // surface stays live while Godot keeps rendering; frames are read back via
+    // getBitmap() and handed to GDScript as RGBA bytes.
+    private var inAppPlayer: MediaPlayer? = null
+    private var inAppTextureView: TextureView? = null
+    private var inAppBitmap: Bitmap? = null
+    private var inAppFrameSizePx = 0
+    private val inAppFrameLock = Any()
+    private var prepared = false
 
     // --- Biometric ---
 
@@ -200,6 +226,94 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
             false
         }
     }
+
+    /**
+     * Decodes a MediaStore item (image or video) down to a center-cropped square
+     * thumbnail and writes it as PNG to destAbsPath. Returns true on success.
+     * Runs on the Godot call (main) thread, so GDScript should chunk large batches.
+     */
+    @UsedByGodot
+    fun load_thumbnail(uriStr: String, destAbsPath: String, sizePx: Int): Boolean {
+        val activity = getActivity() ?: return false
+        return try {
+            val uri = Uri.parse(uriStr)
+            val size = if (sizePx <= 0) 256 else sizePx
+            val bmp = decodeImageThumbnail(activity, uri, size)
+                ?: decodeVideoThumbnail(activity, uri, size)
+            if (bmp == null) {
+                false
+            } else {
+                try {
+                    FileOutputStream(File(destAbsPath)).use { out ->
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Decodes an image item, downsampled, into a center-cropped square thumbnail. */
+    private fun decodeImageThumbnail(context: Context, uri: Uri, size: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { s ->
+            BitmapFactory.decodeStream(s, null, bounds)
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        val maxDim = max(bounds.outWidth, bounds.outHeight)
+        while (maxDim / (sample * 2) >= size) {
+            sample *= 2
+        }
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bmp = context.contentResolver.openInputStream(uri)?.use { s ->
+            BitmapFactory.decodeStream(s, null, opts)
+        } ?: return null
+        return centerCrop(bmp, size)
+    }
+
+    /** Grabs a representative frame for a video item, cropped to a square thumbnail. */
+    private fun decodeVideoThumbnail(context: Context, uri: Uri, size: Int): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            // getScaledFrameAtTime requires API 27+; older devices fall back to the
+            // raw frame and centerCrop handles the scaling.
+            var frame: Bitmap? = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                frame = retriever.getScaledFrameAtTime(
+                    1_000_000,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                    size,
+                    size,
+                )
+            }
+            if (frame == null) {
+                frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            }
+            frame?.let { centerCrop(it, size) }
+        } catch (e: Exception) {
+            null
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** Center-crops a bitmap to a square and scales it to size×size. */
+    private fun centerCrop(src: Bitmap, size: Int): Bitmap? {
+        val w = src.width
+        val h = src.height
+        if (w <= 0 || h <= 0) return null
+        val side = min(w, h)
+        val x = (w - side) / 2
+        val y = (h - side) / 2
+        val cropped = Bitmap.createBitmap(src, x, y, side, side)
+        return if (side != size) Bitmap.createScaledBitmap(cropped, size, size, true) else cropped
+    }
     @UsedByGodot
     fun open_photo_picker() {
         val activity = getActivity() ?: return
@@ -341,6 +455,161 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                     // ignored
                 }
             }
+        }
+    }
+
+    // --- In-app video playback (MediaPlayer decoded, frames read back) -------
+
+    /**
+     * Starts decoding a local video file. A 1x1 TextureView is attached so the
+     * decode surface stays live while Godot keeps rendering the UI; frames are
+     * polled from GDScript via grab_inapp_frame(). Auto-plays when prepared.
+     * Returns true when the view was scheduled (playback starts asynchronously).
+     */
+    @UsedByGodot
+    fun start_inapp_video(path: String, frameWidth: Int, frameHeight: Int): Boolean {
+        val activity = getActivity() ?: return false
+        stop_inapp_video()
+        runOnUiThread {
+            try {
+                val w = if (frameWidth <= 0) 640 else frameWidth.coerceIn(176, 1280)
+                val h = if (frameHeight <= 0) 360 else frameHeight.coerceIn(144, 720)
+                prepared = false
+                val tv = TextureView(activity)
+                tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(st: SurfaceTexture, w0: Int, h0: Int) {
+                        try {
+                            val mp = MediaPlayer()
+                            mp.setDataSource(path)
+                            mp.setSurface(Surface(st))
+                            mp.setOnPreparedListener { p ->
+                                prepared = true
+                                p.start()
+                            }
+                            mp.setOnCompletionListener { emitSignal("inapp_video_closed") }
+                            mp.setOnErrorListener { _, _, _ ->
+                                emitSignal("inapp_video_closed")
+                                true
+                            }
+                            mp.prepareAsync()
+                            inAppPlayer = mp
+                        } catch (e: Exception) {
+                            emitSignal("inapp_video_closed")
+                        }
+                    }
+
+                    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w0: Int, h0: Int) {}
+
+                    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                        stop_inapp_video()
+                        return true
+                    }
+
+                    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                        val bmp = tv.getBitmap(w, h)
+                        if (bmp != null) {
+                            synchronized(inAppFrameLock) {
+                                inAppBitmap?.recycle()
+                                inAppBitmap = bmp
+                            }
+                        }
+                    }
+                }
+                val lp = FrameLayout.LayoutParams(1, 1)
+                lp.gravity = Gravity.TOP or Gravity.START
+                val host = activity.findViewById<ViewGroup>(android.R.id.content)
+                if (host != null) {
+                    host.addView(tv, lp)
+                    inAppTextureView = tv
+                } else {
+                    emitSignal("inapp_video_closed")
+                }
+            } catch (e: Exception) {
+                emitSignal("inapp_video_closed")
+            }
+        }
+        return true
+    }
+
+    @UsedByGodot
+    fun pause_inapp_video(): Boolean {
+        val mp = inAppPlayer ?: return false
+        return try {
+            mp.pause()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    @UsedByGodot
+    fun resume_inapp_video(): Boolean {
+        val mp = inAppPlayer ?: return false
+        return try {
+            mp.start()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    @UsedByGodot
+    fun is_inapp_video_playing(): Boolean {
+        return try {
+            inAppPlayer?.isPlaying == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    @UsedByGodot
+    fun stop_inapp_video(): Boolean {
+        runOnUiThread {
+            try {
+                inAppPlayer?.stop()
+            } catch (e: Exception) {
+            }
+            try {
+                inAppPlayer?.release()
+            } catch (e: Exception) {
+            }
+            inAppPlayer = null
+            try {
+                inAppTextureView?.let {
+                    it.surfaceTextureListener = null
+                    (it.parent as? ViewGroup)?.removeView(it)
+                }
+            } catch (e: Exception) {
+            }
+            inAppTextureView = null
+            synchronized(inAppFrameLock) {
+                inAppBitmap?.recycle()
+                inAppBitmap = null
+            }
+            prepared = false
+        }
+        return true
+    }
+
+    /** Returns the latest decoded frame as packed RGBA bytes, or empty. */
+    @UsedByGodot
+    fun grab_inapp_frame(): ByteArray {
+        synchronized(inAppFrameLock) {
+            val bmp = inAppBitmap ?: return ByteArray(0)
+            val w = bmp.width
+            val h = bmp.height
+            if (w <= 0 || h <= 0) return ByteArray(0)
+            val pixels = IntArray(w * h)
+            bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+            val out = ByteArray(w * h * 4)
+            var i = 0
+            for (argb in pixels) {
+                out[i++] = ((argb shr 16) and 0xff).toByte()
+                out[i++] = ((argb shr 8) and 0xff).toByte()
+                out[i++] = (argb and 0xff).toByte()
+                out[i++] = ((argb shr 24) and 0xff).toByte()
+            }
+            return out
         }
     }
 

@@ -13,9 +13,9 @@ hongni/
 │       ├── store/           # SQLite 迁移 + 数据访问 + sync_log
 │       ├── blob/            # 内容寻址存储 + 缩略图
 │       └── api/             # 路由 + Bearer 鉴权中间件 + handlers
-├── plugin-android/          # 插件 Kotlin 源码 + gradle 工程（构建 AAR）
 └── app/                     # Godot 4.7 客户端（竖屏）
     ├── project.godot        # 自动加载单例 + 竖屏配置
+    ├── plugin-android/      # 插件 Kotlin 源码 + gradle 工程（构建 AAR）
     ├── scenes/              # main / albums / album_view / viewer / settings / system_album
     ├── scripts/             # GDScript：Store/Api/Sync/Lock + 各场景脚本
     └── addons/hongni_plugin # Android 插件 AAR + 导出脚本

@@ -53,8 +53,6 @@ func _ready() -> void:
 	_album_name = Api.current_album_name
 	_is_all = (_album_id > 0 and _album_id == Api.current_trunk_id)
 	_build_ui()
-	if not Lock.photo_picker_result.is_connected(_on_picker_result):
-		Lock.photo_picker_result.connect(_on_picker_result)
 	_load.call_deferred()
 
 
@@ -80,11 +78,6 @@ func _build_ui() -> void:
 	var spacer := Control.new()
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	top.add_child(spacer)
-
-	var btn_upload := Button.new()
-	btn_upload.text = "上传"
-	btn_upload.pressed.connect(_upload)
-	top.add_child(btn_upload)
 
 	progress = ProgressBar.new()
 	progress.min_value = 0.0
@@ -421,7 +414,7 @@ func _show_photo_menu(asset_id: int, asset_name: String, asset_ext: String = "")
 	ctx_menu.add_item(_fav_label(asset_id), MenuId.FAV_TOGGLE)
 	ctx_menu.add_item("移动到", MenuId.MOVE)
 	ctx_menu.add_item("复制到", MenuId.COPY)
-	ctx_menu.add_item("改名", MenuId.RENAME)
+	ctx_menu.add_item("重命名", MenuId.RENAME)
 	ctx_menu.add_item("删除", MenuId.DELETE)
 	ctx_menu.popup(Rect2i(Vector2i(get_global_mouse_position()), Vector2i.ZERO))
 
@@ -574,61 +567,12 @@ func _upload_album_id() -> int:
 	return _album_id
 
 
-func _upload() -> void:
-	if _upload_album_id() <= 0:
-		_set_mode_status(false, "无可用上传相册")
-		return
-	if OS.get_name() == "Android":
-		Lock.open_photo_picker()
-		return
-	var fd := FileDialog.new()
-	fd.access = FileDialog.ACCESS_FILESYSTEM
-	fd.file_mode = FileDialog.FILE_MODE_OPEN_FILES
-	fd.filters = PackedStringArray([
-		"*.png,*.jpg,*.jpeg,*.webp,*.gif ; 图片",
-		"*.mp4,*.mov,*.mkv,*.webm ; 视频",
-	])
-	fd.files_selected.connect(_on_files_selected)
-	add_child(fd)
-	fd.popup_centered()
-
-
-func _on_files_selected(paths: PackedStringArray) -> void:
-	var total := paths.size()
-	var done := 0
-	for p in paths:
-		var name := p.get_file()
-		var media_type := "video" if _is_video(name) else "image"
-		var taken_at := int(FileAccess.get_modified_time(p))
-		await Api.upload_asset(p, name, media_type, taken_at, _upload_album_id())
-		done += 1
-		if total > 0:
-			progress.value = float(done) / float(total)
-	_refresh_grid.call_deferred()
-
-
-func _on_picker_result(uris: Array) -> void:
-	for uri in uris:
-		var name := _name_from_uri(uri)
-		var dest := ProjectSettings.globalize_path("user://photos/" + name)
-		if Lock.read_media_bytes(uri, dest):
-			var media_type := "video" if _is_video(name) else "image"
-			await Api.upload_asset(dest, name, media_type, int(FileAccess.get_modified_time(dest)), _upload_album_id())
-			DirAccess.remove_absolute(dest)
-	_refresh_grid.call_deferred()
-
-
 func _is_video(name: String) -> bool:
 	match name.get_extension().to_lower():
 		"mp4", "mov", "mkv", "webm":
 			return true
 		_:
 			return false
-
-
-func _name_from_uri(uri: String) -> String:
-	var parts := uri.split("/")
-	return parts[parts.size() - 1] if not parts.is_empty() else "import"
 
 
 # --- Misc --------------------------------------------------------------------

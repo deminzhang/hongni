@@ -6,6 +6,7 @@ extends Node
 
 signal lan_result(addresses: Array)
 signal photo_picker_result(uris: Array)
+signal inapp_video_closed
 signal _pin_prompt_submitted(text: String)
 
 
@@ -25,6 +26,8 @@ func _ready() -> void:
 			p.lan_scan_result.connect(_on_lan_scan_result)
 		if p.has_signal("photo_picker_result"):
 			p.photo_picker_result.connect(_on_photo_picker_result)
+		if p.has_signal("inapp_video_closed"):
+			p.inapp_video_closed.connect(func() -> void: inapp_video_closed.emit())
 
 
 func _has_plugin() -> bool:
@@ -153,6 +156,14 @@ func read_media_bytes(uri: String, dest_abs_path: String) -> bool:
 	return _plugin().read_media_bytes(uri, dest_abs_path)
 
 
+## Generates a small center-cropped PNG thumbnail of a MediaStore item (image or
+## video) into dest_abs_path. Android plugin only; false on desktop/editor.
+func load_thumbnail(uri: String, dest_abs_path: String, size_px: int) -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().load_thumbnail(uri, dest_abs_path, size_px)
+
+
 ## Writes an image file (absolute path) into the device system album
 ## (Pictures/Hongni). Android-only; false on desktop/editor.
 func save_to_gallery(src_abs_path: String, display_name: String, mime_type: String) -> bool:
@@ -167,6 +178,47 @@ func play_video(path_or_uri: String) -> void:
 	else:
 		# Desktop/editor: no plugin, open the file with the OS default app.
 		OS.shell_open(path_or_uri)
+
+
+# --- In-app video playback (Android plugin MediaPlayer -> Godot frames) ------
+
+## Starts decoding a local path into the app; GDScript polls grab_inapp_frame()
+## and renders it in an in-app TextureRect. Android-only; false on desktop.
+func start_inapp_video(path: String, frame_w: int, frame_h: int) -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().start_inapp_video(path, frame_w, frame_h)
+
+
+func pause_inapp_video() -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().pause_inapp_video()
+
+
+func resume_inapp_video() -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().resume_inapp_video()
+
+
+func is_inapp_video_playing() -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().is_inapp_video_playing()
+
+
+func stop_inapp_video() -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().stop_inapp_video()
+
+
+## Latest decoded frame as packed RGBA bytes (empty when none/desktop).
+func grab_inapp_frame() -> PackedByteArray:
+	if not _has_plugin():
+		return PackedByteArray()
+	return _plugin().grab_inapp_frame()
 
 
 func open_photo_picker() -> void:
