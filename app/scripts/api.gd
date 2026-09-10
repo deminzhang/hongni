@@ -19,10 +19,12 @@ var current_device_bucket: String = ""
 var current_filter: String = "all"
 var viewer_assets: Array = []
 var viewer_index: int = 0
-# Active trunk (相册/隐私) and its built-in buckets, filled by albums.gd on
-# reload so album_view can resolve "全部" aggregation, favorite toggling,
-# move/copy sources, and upload targets.
-var current_trunk: String = "相册"
+# Active trunk and its built-in buckets, filled by albums.gd on reload so
+# album_view can resolve "全部" aggregation, favorite toggling, move/copy
+# sources, and upload targets. Starts on 系统相册 (matching albums.gd's
+# TRUNK_SYSTEM): the device gallery is what the user browses, with the cloud
+# showing up as each item's ☁ 已备份 state.
+var current_trunk: String = "系统相册"
 var current_trunk_id: int = 0
 var favorite_album_id: int = 0
 var scatter_album_id: int = 0
@@ -32,6 +34,23 @@ var import_album_id: int = 0
 
 
 const API_PATH := "/api/v1"
+
+## The 相册 trunk's buckets that hold un-filed photos.
+const SCRATCH_BUCKETS := ["散照", "未分类散照"]
+## Names that already mean something inside a trunk: a device album called 收藏
+## must not be mirrored onto the favourites bucket, nor a device album called
+## 散照 collide with the scratch bucket.
+const RESERVED_ALBUM_NAMES := ["相册", "隐私", "收藏", "散照", "未分类散照"]
+## The two cloud trunks, by their server-side top-level album name. These are
+## wire values: the client's tab identifiers and the server's rows must agree,
+## so they are defined once, here.
+const TRUNK_CLOUD := "相册"
+const TRUNK_PRIVATE := "隐私"
+## Device album name -> cloud album id, so an upload from a device album resolves
+## its target once instead of re-listing the albums for every photo.
+var _device_albums: Dictionary = {}
+## Trunk name -> its 散照 bucket id, resolved once per run.
+var _trunk_scatter: Dictionary = {}
 
 
 ## Sends a request to the server, walking the node list on transport failure:
@@ -209,8 +228,14 @@ func list_assets(filter: String = "all", album_id: int = 0, cursor: String = "")
 	return await _do_request(HTTPClient.METHOD_GET, path)
 
 
-func delete_asset(id: int) -> Dictionary:
-	return await _do_request(HTTPClient.METHOD_DELETE, "/assets/%d" % id)
+## Deletes a cloud asset. `album_id` is the album the delete came from: a real
+## album drops just that album's reference, and the photo goes to the recycle bin
+## only when nothing else holds it (the response's `trashed` says which happened).
+func delete_asset(id: int, album_id: int = 0) -> Dictionary:
+	var path := "/assets/%d" % id
+	if album_id > 0:
+		path += "?album_id=%d" % album_id
+	return await _do_request(HTTPClient.METHOD_DELETE, path)
 
 
 func update_asset(id: int, fields: Dictionary) -> Dictionary:
@@ -250,29 +275,84 @@ func list_albums() -> Dictionary:
 	return await _do_request(HTTPClient.METHOD_GET, "/albums")
 
 
-## The 散照 bucket of the 相册 (cloud) trunk — where uploads from the device
-## gallery land, so imported photos show up under 红泥相册 → 全部. Resolved from
-## the album list on first use and cached on the instance; 0 when unavailable
-## (offline, or the trunk/bucket is missing).
-func resolve_scatter_album() -> int:
-	if import_album_id > 0:
+## The 散照 bucket of a cloud trunk (`相册` / `隐私`) — where a single file lands
+## when it is moved or copied onto that trunk. Resolved from the album list on
+## first use and cached per trunk; 0 when unavailable (offline, or the trunk
+## holds no such bucket).
+func resolve_scatter_album(trunk_name: String = TRUNK_CLOUD) -> int:
+	if trunk_name == TRUNK_CLOUD and import_album_id > 0:
 		return import_album_id
+	if _trunk_scatter.has(trunk_name):
+		return int(_trunk_scatter[trunk_name])
 	var r: Dictionary = await list_albums()
 	if r.has("error"):
 		return 0
 	var albums: Array = r["data"]["albums"]
-	var trunk_id := 0
-	for a in albums:
-		if a.get("parent_id") == null and str(a.get("name", "")) == "相册":
-			trunk_id = int(a["id"])
-			break
+	var trunk_id := _trunk_id_named(albums, trunk_name)
+	if trunk_id <= 0:
+		return 0
+	var id := _scatter_of(albums, trunk_id)
+	if id > 0:
+		_trunk_scatter[trunk_name] = id
+	return id
+
+
+## The cloud album mirroring the device album `bucket_name`, under the 相册
+## trunk: looked up by name and created on the first upload from that album, so
+## the cloud side stays organised the way the system gallery is instead of
+## piling every device photo into 散照. Resolved ids are cached for the run.
+## Names the trunk reserves, a nameless bucket, and an unreachable cloud all
+## fall back to 散照 (0 when even that is unknown, which fails the upload).
+func resolve_device_album(bucket_name: String) -> int:
+	var name := bucket_name.strip_edges()
+	if name == "" or RESERVED_ALBUM_NAMES.has(name):
+		return await resolve_scatter_album(TRUNK_CLOUD)
+	if _device_albums.has(name):
+		return int(_device_albums[name])
+	var r: Dictionary = await list_albums()
+	if r.has("error"):
+		return 0
+	var albums: Array = r["data"]["albums"]
+	var trunk_id := _trunk_id_named(albums, TRUNK_CLOUD)
 	if trunk_id <= 0:
 		return 0
 	for a in albums:
-		if int(a.get("parent_id", 0)) == trunk_id and str(a.get("name", "")) in ["散照", "未分类散照"]:
+		if _is_child_of(a, trunk_id) and str(a.get("name", "")) == name:
+			_device_albums[name] = int(a["id"])
+			return int(a["id"])
+	var created: Dictionary = await create_album(name, trunk_id, false, "two_way")
+	if created.has("error"):
+		return _scatter_of(albums, trunk_id)
+	var id := int(created["data"]["id"])
+	_device_albums[name] = id
+	return id
+
+
+## Whether album `a` is a direct child of `parent_id`. The server sends
+## `"parent_id": null` for a top-level trunk, and `int(null)` is an error —
+## `Dictionary.get()` hands back the stored null, not its default.
+func _is_child_of(a: Dictionary, parent_id: int) -> bool:
+	var pid = a.get("parent_id")
+	return pid != null and int(pid) == parent_id
+
+
+## The id of the top-level trunk album named `name` in `albums`, 0 when absent.
+func _trunk_id_named(albums: Array, name: String) -> int:
+	for a in albums:
+		if a.get("parent_id") == null and str(a.get("name", "")) == name:
+			return int(a["id"])
+	return 0
+
+
+## The trunk's 散照 bucket in `albums`, remembered for later uploads; 0 when the
+## trunk has none.
+func _scatter_of(albums: Array, trunk_id: int) -> int:
+	for a in albums:
+		if _is_child_of(a, trunk_id) and str(a.get("name", "")) in SCRATCH_BUCKETS:
 			import_album_id = int(a["id"])
 			return import_album_id
 	return 0
+
 
 
 func create_album(name: String, parent_id: int, is_hidden: bool, sync_mode: String) -> Dictionary:
@@ -282,6 +362,16 @@ func create_album(name: String, parent_id: int, is_hidden: bool, sync_mode: Stri
 	if is_hidden:
 		body["is_hidden"] = true
 	return await _do_request(HTTPClient.METHOD_POST, "/albums", JSON.stringify(body), PackedStringArray(["Content-Type: application/json"]))
+
+
+## Moves album `id` under `parent_id` (0 = up to the trunk level). One call, not
+## a list-and-reparent loop: the server does it in a transaction and merges the
+## album into a same-named sibling when the target already has one, which the
+## client could not do safely with a sequence of smaller requests.
+## Returns {"album": {...}, "merged_into": <int|null>, "moved": <int>}.
+func move_album(id: int, parent_id: int) -> Dictionary:
+	var body := {"parent_id": parent_id if parent_id > 0 else null}
+	return await _do_request(HTTPClient.METHOD_POST, "/albums/%d/move" % id, JSON.stringify(body), PackedStringArray(["Content-Type: application/json"]))
 
 
 func get_asset(id: int) -> Dictionary:

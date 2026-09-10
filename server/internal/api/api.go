@@ -48,6 +48,7 @@ func New(s *store.Store, b *blob.Store, cfg config.Config) http.Handler {
 	api.HandleFunc("PATCH /albums/{id}", sv.handleUpdateAlbum)
 	api.HandleFunc("DELETE /albums/{id}", sv.handleDeleteAlbum)
 	api.HandleFunc("POST /albums/{id}/assets", sv.handleAddAssetToAlbum)
+	api.HandleFunc("POST /albums/{id}/move", sv.handleMoveAlbum)
 	api.HandleFunc("DELETE /albums/{id}/assets/{asset_id}", sv.handleRemoveAssetFromAlbum)
 	api.HandleFunc("GET /trash", sv.handleListTrash)
 	api.HandleFunc("POST /trash/{id}/restore", sv.handleRestoreAsset)
@@ -216,6 +217,12 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "unnamed"
 	}
+	albumID := int64(0)
+	if v := r.FormValue("album_id"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			albumID = n
+		}
+	}
 	mime := r.FormValue("mime_type")
 	if mime == "" {
 		mime = defaultMime(name, mediaType)
@@ -246,6 +253,31 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	// A name already used inside this album changes the outcome: the same bytes
+	// are one file (link the copy that is already there), different bytes mean
+	// this upload is the newcomer and gets numbered.
+	if albumID > 0 {
+		resolved, existing, err := s.store.NameInAlbum(r.Context(), albumID, hashHex, name)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if existing > 0 {
+			if err := s.store.AddAssetToAlbum(r.Context(), albumID, existing); err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			prev, err := s.store.GetAsset(r.Context(), existing)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, assetResponse{Asset: *prev, Deduplicated: true})
+			return
+		}
+		name = resolved
 	}
 
 	// Write blob (no-op if already present) and thumbnail.
@@ -302,10 +334,8 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	a.ID = id
 
-	if v := r.FormValue("album_id"); v != "" {
-		if aid, err := strconv.ParseInt(v, 10, 64); err == nil {
-			_ = s.store.AddAssetToAlbum(r.Context(), aid, id)
-		}
+	if albumID > 0 {
+		_ = s.store.AddAssetToAlbum(r.Context(), albumID, id)
 	}
 
 	writeJSON(w, http.StatusCreated, assetResponse{Asset: a, Deduplicated: dedup, Thumb: thumbOK})
@@ -358,7 +388,33 @@ func (s *server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	// Active delete = soft delete into the recycle bin (7-day restore window).
+	// `album_id` says which album the delete came from. Inside a real album that
+	// means "drop this album's copy": the photo itself only reaches the recycle
+	// bin when no other album holds it. 全部 / 视频 / 收藏 are views of the whole
+	// library, so deleting there still means deleting the photo.
+	if v := r.URL.Query().Get("album_id"); v != "" {
+		if albumID, err := strconv.ParseInt(v, 10, 64); err == nil && albumID > 0 {
+			scoped, err := s.store.AlbumScopedDelete(r.Context(), albumID)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if scoped {
+				trashed, err := s.store.RemoveOrTrash(r.Context(), albumID, id)
+				if errors.Is(err, store.ErrNotFound) {
+					writeErr(w, http.StatusNotFound, "not found")
+					return
+				}
+				if err != nil {
+					writeErr(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "trashed": trashed})
+				return
+			}
+		}
+	}
+	// Active delete = soft delete into the recycle bin (30-day restore window).
 	if err := s.store.TrashAsset(r.Context(), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "not found")
@@ -367,7 +423,7 @@ func (s *server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "trashed": true})
 }
 
 func (s *server) handleAssetPatch(w http.ResponseWriter, r *http.Request) {
@@ -399,10 +455,10 @@ func (s *server) handleAssetPatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a)
 }
 
-const trashRetentionSecs = 7 * 24 * 3600
+const trashRetentionSecs = 30 * 24 * 3600
 
 // handleListTrash lists the recycle bin, optionally for one trunk, lazily
-// purging assets older than the 7-day retention window first.
+// purging assets older than the 30-day retention window first.
 func (s *server) handleListTrash(w http.ResponseWriter, r *http.Request) {
 	cutoff := time.Now().Unix() - trashRetentionSecs
 	if hashes, err := s.store.PurgeExpiredTrash(r.Context(), cutoff); err == nil {
@@ -644,6 +700,48 @@ func (s *server) handleDeleteAlbum(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleMoveAlbum 迁移相册；目标层级已存在同名相册时并入它而不是建重复项。
+func (s *server) handleMoveAlbum(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req struct {
+		ParentID *int64 `json:"parent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.ParentID != nil {
+		if *req.ParentID < 0 {
+			writeErr(w, http.StatusBadRequest, "invalid parent_id")
+			return
+		}
+		if *req.ParentID == 0 {
+			req.ParentID = nil // 0 与 null 同义，都表示移到主干层级
+		}
+	}
+	album, mergedInto, moved, err := s.store.MoveAlbum(r.Context(), id, req.ParentID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "album not found")
+		return
+	case errors.Is(err, store.ErrCycle):
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"album":       album,
+		"merged_into": mergedInto,
+		"moved":       moved,
+	})
+}
+
 func (s *server) handleAddAssetToAlbum(w http.ResponseWriter, r *http.Request) {
 	albumID, err := parseID(r.PathValue("id"))
 	if err != nil {
@@ -679,11 +777,19 @@ func (s *server) handleRemoveAssetFromAlbum(w http.ResponseWriter, r *http.Reque
 		writeErr(w, http.StatusBadRequest, "invalid asset_id")
 		return
 	}
-	if err := s.store.RemoveAssetFromAlbum(r.Context(), albumID, assetID); err != nil {
+	// Dropping a reference never leaves the photo without a home: taking it out
+	// of its last album parks it in that trunk's 散照 (see RemoveOrPark), which
+	// is what un-starring a favourite has to mean.
+	parked, err := s.store.RemoveOrPark(r.Context(), albumID, assetID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "parked": parked})
 }
 
 func (s *server) handleSyncChanges(w http.ResponseWriter, r *http.Request) {

@@ -6,6 +6,16 @@ extends Node
 
 signal lan_result(addresses: Array)
 signal photo_picker_result(uris: Array)
+## MediaStore ids the platform actually removed, after a delete request. Android
+## asks the user to confirm before another app's media can be deleted, so the
+## outcome arrives here rather than in the return value of delete_media().
+signal media_deleted(ids: Array)
+
+## Every emission of `media_deleted`, counted. A caller that must not miss a
+## report which raced ahead of its await reads this before the request and hands
+## it to await_media_delete().
+var _media_delete_seq := 0
+var _media_delete_ids: Array = []
 signal inapp_video_closed
 signal inapp_video_prepared
 signal _pin_prompt_submitted(text: String)
@@ -27,6 +37,8 @@ func _ready() -> void:
 			p.lan_scan_result.connect(_on_lan_scan_result)
 		if p.has_signal("photo_picker_result"):
 			p.photo_picker_result.connect(_on_photo_picker_result)
+		if p.has_signal("media_delete_result"):
+			p.media_delete_result.connect(_on_media_delete_result)
 		if p.has_signal("inapp_video_closed"):
 			p.inapp_video_closed.connect(func() -> void: inapp_video_closed.emit())
 		if p.has_signal("inapp_video_prepared"):
@@ -328,6 +340,57 @@ func open_photo_picker() -> void:
 func _on_photo_picker_result(json_str: String) -> void:
 	var parsed = JSON.parse_string(json_str)
 	photo_picker_result.emit(parsed if parsed is Array else [])
+
+
+## Whether the app can see the whole device gallery. Android 14 lets the user
+## grant a hand-picked subset of photos instead, in which case a scan lists only
+## those and says nothing about the rest. Desktop reads the Pictures folder
+## directly, so it is always complete.
+func has_full_media_access() -> bool:
+	if _has_plugin():
+		return _plugin().has_full_media_access()
+	return true
+
+
+## Asks the platform to delete the given device items (each needs `uri` and
+## `key`). Returns the number removed outright, or -1 when Android raised its
+## confirmation dialog — the ids that actually went away then arrive on
+## `media_deleted`, and the caller should read the outcome back with
+## await_media_delete(). Desktop never calls this: there is no MediaStore.
+func delete_media(items: Array) -> int:
+	if not _has_plugin():
+		return -1
+	var payload := []
+	for it in items:
+		payload.append({"uri": str(it.get("uri", "")), "id": str(it.get("key", ""))})
+	return int(_plugin().delete_media(JSON.stringify(payload)))
+
+
+## The delete-report counter as of now; read it just before delete_media().
+func media_delete_seq() -> int:
+	return _media_delete_seq
+
+
+## Waits for a delete report newer than `since` and returns the new counter.
+##
+## Waiting on the signal directly would be wrong: Android 10 reports a partial
+## success from inside delete_media() itself, before the caller can await, and
+## the confirmation dialog's outcome is a second report. Racing ahead is
+## therefore normal, not an error — so this polls the counter.
+func await_media_delete(since: int, timeout: float = 30.0) -> int:
+	var deadline := Time.get_ticks_msec() + int(timeout * 1000.0)
+	while _media_delete_seq <= since:
+		if Time.get_ticks_msec() > deadline:
+			return _media_delete_seq
+		await get_tree().process_frame
+	return _media_delete_seq
+
+
+func _on_media_delete_result(json_str: String) -> void:
+	var parsed = JSON.parse_string(json_str)
+	_media_delete_ids = parsed if parsed is Array else []
+	_media_delete_seq += 1
+	media_deleted.emit(_media_delete_ids)
 
 
 # --- mDNS LAN discovery ---

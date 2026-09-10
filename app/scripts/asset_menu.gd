@@ -1,13 +1,14 @@
 extends Control
 ## Shared per-asset action menu, used by both the album photo grid and the
 ## full-screen viewer. Owns:
-##   - the rightmost ⋮ PopupMenu. For cloud assets: 收藏 / 移动到 / 复制到 /
-##     设为相册封面 / 重命名 / 删除 / 详细, operating on one asset (viewer) or on
-##     the current multi-selection (grid). For device (系统相册) media: 上传到红泥 /
-##     详细 — the device owns the file, so the only thing to do with it here is
-##     bring it into the cloud.
-##   - the album picker and rename dialogs those entries need,
-##   - the bottom 详细 sheet (details_sheet.gd).
+##   - the rightmost ⋮ PopupMenu. Cloud assets get 收藏 / 移动到 / 复制到 /
+##     设为相册封面 / 重命名 / 删除 / 保留云端 / 详细. Device (系统相册) media gets
+##     移动到 / 复制到 / 保留云端 / 从本机删除 / 详细 — there the device owns
+##     the file, so every action either pushes a copy into the cloud or asks the
+##     platform to remove the device's own file.
+##   - the target picker those 移动/复制 entries need: either of the two cloud
+##     trunks, a real sub-album of the current trunk, or the device gallery,
+##   - the rename dialog and the bottom 详细 sheet.
 ##
 ## Call `setup(host, source_album)` once, then `popup(assets)` with the target
 ## assets. Mutations are reported through `changed(ids, op)` so the owner can
@@ -16,10 +17,27 @@ extends Control
 signal changed(ids: Array, op: String)
 signal notice(text: String)
 
-enum MenuId { FAV_TOGGLE, MOVE, COPY, SET_COVER, RENAME, DELETE, DETAILS, UPLOAD }
+enum MenuId { FAV_TOGGLE, MOVE, COPY, SET_COVER, RENAME, DELETE, DETAILS, KEEP, DELETE_DEVICE }
+
+## Where a 移动到/复制到 can send one asset:
+##   ALBUM   a real sub-album under one of the trunks,
+##   TRUNK   a cloud trunk as a whole — a single file lands in its 散照 (a device
+##           item going to 红泥 lands in the album mirroring its device album,
+##           so the grouping the system gallery shows is the one the cloud keeps),
+##   DEVICE  the device gallery itself, written as an export into Pictures/红泥.
+enum TargetKind { ALBUM, TRUNK, DEVICE }
+
+## What the picker offers: 移动/复制 lists the trunks as well as the current
+## trunk's sub-albums; 设为相册封面 only lists sub-albums (a cover belongs to one
+## specific cloud album).
+const PICK_TARGET := 0
+const PICK_COVER := 1
 
 const DETAILS := preload("res://scripts/details_sheet.gd")
 const FAVORITE := "收藏"
+# Where an exported cloud photo lands on the device: the app may only add media
+# it owns without a prompt, so it cannot write into the device's own albums.
+const EXPORT_DIR_NAME := "红泥"
 # Album picker sizing: a name must fit even when it is this many CJK
 # characters long, measured on a sample of exactly that length (CJK glyphs are
 # the widest case), plus the room the dropdown arrow and the button's inner
@@ -78,91 +96,79 @@ func popup(assets: Array, at := Vector2.INF) -> void:
 		return
 	_targets = targets
 	var single := targets.size() == 1
-	if DeviceMedia.is_device(targets[0]):
-		# Device media has no cloud record yet: the one meaningful action is
-		# bringing it over, plus the 详细 sheet.
-		_menu.clear()
-		_menu.add_item("导入到红泥", MenuId.UPLOAD)
-		_menu.add_item("详细", MenuId.DETAILS)
-		_menu.set_item_disabled(1, not single)
-		_menu.popup(Rect2i(Vector2i(at if at != Vector2.INF else get_global_mouse_position()), Vector2i.ZERO))
-		return
-	_load_favorites()
-	var cloud := _as_int(targets[0].get("id")) > 0
-	var image := str(targets[0].get("media_type", "image")) == "image"
+	var pos := Rect2i(Vector2i(at if at != Vector2.INF else get_global_mouse_position()), Vector2i.ZERO)
 	_menu.clear()
+	if DeviceMedia.is_device(targets[0]):
+		_device_menu(single)
+	else:
+		_cloud_menu(single)
+	_menu.popup(pos)
+
+
+## Menu for device (系统相册) media: nothing here is a cloud operation, since the
+## device owns these files — the entries either push a copy up or hand the file
+## back to the platform.
+func _device_menu(single: bool) -> void:
+	_menu.add_item("移动到", MenuId.MOVE)
+	_menu.add_item("复制到", MenuId.COPY)
+	_menu.add_item(_keep_label(), MenuId.KEEP)
+	_menu.add_item("从本机删除", MenuId.DELETE_DEVICE)
+	_menu.add_item("详细", MenuId.DETAILS)
+	# 保留 is about the cloud copy that already exists, so it needs a single,
+	# already-backed-up item; 详细 describes one item.
+	_menu.set_item_disabled(_menu.get_item_index(MenuId.KEEP), not single or _keep_target_id(_targets[0]) <= 0)
+	_menu.set_item_disabled(_menu.get_item_index(MenuId.DETAILS), not single)
+
+
+## Menu for cloud assets. 收藏 is a view (the server keeps it as a real album row,
+## but nothing is filed there — a photo "in" 收藏 is starred, not stored), so its
+## menu carries no 删除/移动/复制: those are container actions, and doing them from
+## a view is how a photo ends up filed nowhere. 取消收藏 is the way out of it.
+func _cloud_menu(single: bool) -> void:
+	_load_favorites()
+	var cloud := _as_int(_targets[0].get("id")) > 0
+	var image := str(_targets[0].get("media_type", "image")) == "image"
+	var fav_view := _in_favorites()
 	_menu.add_item(_fav_label(), MenuId.FAV_TOGGLE)
-	_menu.add_item("移动到相册", MenuId.MOVE)
-	_menu.add_item("复制到相册", MenuId.COPY)
+	if not fav_view:
+		_menu.add_item("移动到", MenuId.MOVE)
+		_menu.add_item("复制到", MenuId.COPY)
 	_menu.add_item("设为相册封面", MenuId.SET_COVER)
 	_menu.add_item("重命名", MenuId.RENAME)
-	_menu.add_item("删除", MenuId.DELETE)
+	if not fav_view:
+		_menu.add_item("删除", MenuId.DELETE)
+	_menu.add_item(_keep_label(), MenuId.KEEP)
 	_menu.add_item("详细", MenuId.DETAILS)
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.FAV_TOGGLE), not cloud)
-	_menu.set_item_disabled(_menu.get_item_index(MenuId.MOVE), not cloud)
-	_menu.set_item_disabled(_menu.get_item_index(MenuId.COPY), not cloud)
+	_set_item_disabled(MenuId.MOVE, not cloud)
+	_set_item_disabled(MenuId.COPY, not cloud)
 	# A cover is one specific cloud photo: videos have no server thumbnail and a
 	# multi-selection has no single cover to point at.
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.SET_COVER), not single or not cloud or not image)
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.RENAME), not single or not cloud)
-	_menu.set_item_disabled(_menu.get_item_index(MenuId.DELETE), not cloud)
+	_set_item_disabled(MenuId.DELETE, not cloud)
+	_menu.set_item_disabled(_menu.get_item_index(MenuId.KEEP), not single or not cloud)
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.DETAILS), not single)
-	_menu.popup(Rect2i(Vector2i(at if at != Vector2.INF else get_global_mouse_position()), Vector2i.ZERO))
+
+
+## True when the grid/viewer is showing the 收藏 card. Its id is only known once
+## the album list has been read, so an unknown id means "not 收藏".
+func _in_favorites() -> bool:
+	return Api.favorite_album_id > 0 and Api.current_album_id == Api.favorite_album_id
+
+
+## Disables an entry by id, tolerating its absence (收藏 hides 移动/复制/删除, and
+## index -1 would be a range error rather than a no-op).
+func _set_item_disabled(id: int, disabled: bool) -> void:
+	var idx := _menu.get_item_index(id)
+	if idx >= 0:
+		_menu.set_item_disabled(idx, disabled)
 
 
 ## Hides the 详细 sheet (the viewer calls this when the shown asset changes).
 func close_details() -> void:
 	if is_instance_valid(_sheet):
 		_sheet.close()
-
-
-## Deletes cloud assets (soft delete + recycle bin), queueing the cloud delete as
-## a tombstone when the server is unreachable. Also used by the viewer's 删除
-## button, so both entry points share one delete path. Deleting is not gated by
-## the parent PIN: the PIN guards the 隐私相册 entrance only.
-func delete_assets(assets: Array) -> void:
-	var list: Array = []
-	for a in assets:
-		if a is Dictionary and _as_int(a.get("id")) > 0:
-			list.append(a)
-	if list.is_empty():
-		return
-	var ids: Array = []
-	var offline := false
-	for a in list:
-		var id := _as_int(a["id"])
-		var r: Dictionary = await Api.delete_asset(id)
-		if r.has("error"):
-			# Offline: drop local artifacts now, retry the cloud delete on sync.
-			Sync.tombstone_delete(id)
-			offline = true
-		else:
-			Sync.remove_local(id)
-		ids.append(id)
-	if offline:
-		notice.emit("已标记删除 %d 项，联网后同步删除" % ids.size())
-	changed.emit(ids, "delete")
-
-
-## Local copy of an asset's original file: the not-yet-uploaded source, the
-## cached full-res download, or the uploaded source under user://photos.
-## "" when the asset only exists in the cloud.
-func local_source_path(a: Dictionary) -> String:
-	var local := str(a.get("local_path", ""))
-	if local != "" and FileAccess.file_exists(local):
-		return local
-	var id := _as_int(a.get("id"))
-	if id <= 0:
-		return ""
-	var name := str(a.get("original_name", ""))
-	if Cache.original_cached(id, name, str(a.get("ext", ""))):
-		return Cache.original_path(id, name, str(a.get("ext", "")))
-	for e in Store.sync_index:
-		if _as_int(e.get("cloud_asset_id")) == id:
-			var p := "user://photos/" + str(e.get("local_id", "")).trim_prefix("photos/")
-			if FileAccess.file_exists(p):
-				return p
-	return ""
 
 
 func _on_menu(id: int) -> void:
@@ -181,42 +187,339 @@ func _on_menu(id: int) -> void:
 			await delete_assets(_targets)
 		MenuId.DETAILS:
 			_show_details()
-		MenuId.UPLOAD:
-			await _upload_to_cloud()
+		MenuId.KEEP:
+			_toggle_keep()
+		MenuId.DELETE_DEVICE:
+			await _delete_device_items()
 
 
-# --- 上传到红泥 (device media) ------------------------------------------------
+# --- 删除 (cloud) -------------------------------------------------------------
 
-## Copies the selected device items into the cloud: each one is staged into a
-## hidden temp file, uploaded into the cloud trunk's 散照 bucket (which is what
-## the 全部 card aggregates), then the temp copy is dropped. The device's own
-## file is never modified.
-func _upload_to_cloud() -> void:
-	if _targets.is_empty():
+## Deletes cloud assets. Inside a real album that means "drop this album's copy":
+## the photo itself is only trashed when no other album holds it (the server
+## decides, and says which happened), so the same photo can be filed in several
+## albums and leave one without leaving them all. 全部 / 视频 / 收藏 are views of
+## the whole library, so deleting there means deleting the photo. Queueing the
+## cloud delete as a tombstone when the server is unreachable, scope included.
+## Also used by the viewer's 删除 button, so both entry points share one delete
+## path. Deleting is not gated by the parent PIN: the PIN guards the 隐私相册
+## entrance only.
+func delete_assets(assets: Array) -> void:
+	var list: Array = []
+	for a in assets:
+		if a is Dictionary and _as_int(a.get("id")) > 0:
+			list.append(a)
+	if list.is_empty():
 		return
-	var album_id := await Api.resolve_scatter_album()
-	if album_id <= 0:
-		notice.emit("无法上传：云端相册信息不可用")
+	var scope := Api.current_album_id
+	var ids: Array = []
+	var offline := false
+	for a in list:
+		var id := _as_int(a["id"])
+		var r: Dictionary = await Api.delete_asset(id, scope)
+		if r.has("error"):
+			# Offline: drop local artifacts now, retry the cloud delete on sync.
+			Sync.tombstone_delete(id, scope)
+			offline = true
+		elif bool(r.get("data", {}).get("trashed", true)):
+			# 整个资产进了回收站，本机留着的原件与索引才真的没用了。
+			Sync.remove_local(id)
+		ids.append(id)
+	if offline:
+		notice.emit("已标记删除 %d 项，联网后同步删除" % ids.size())
+	changed.emit(ids, "delete")
+
+
+## Local file backing a cloud asset: the cached full-res download. "" when the
+## asset exists only in the cloud — which is what the grid's ↓ badge reports.
+func local_source_path(a: Dictionary) -> String:
+	var id := _as_int(a.get("id"))
+	if id <= 0:
+		return ""
+	var name := str(a.get("original_name", ""))
+	if Cache.original_cached(id, name, str(a.get("ext", ""))):
+		return Cache.original_path(id, name, str(a.get("ext", "")))
+	return ""
+
+
+# --- 保留云端 ----------------------------------------------------------------
+
+## The cloud asset a 保留 pin would apply to: a device item's backed-up copy, or
+## the cloud asset itself. 0 when there is nothing in the cloud to pin.
+func _keep_target_id(a: Dictionary) -> int:
+	if DeviceMedia.is_device(a):
+		return Sync.backed_up_asset_id(a)
+	return _as_int(a.get("id"))
+
+
+func _keep_label() -> String:
+	if _targets.size() == 1 and Store.is_kept(_keep_target_id(_targets[0])):
+		return "取消保留云端"
+	return "保留云端"
+
+
+## Pins 本机删除后云端保留. This is the only exemption from the delete mirror:
+## without it, removing a photo from the system gallery deletes the cloud copy
+## too (into the recycle bin, restorable for 30 days).
+func _toggle_keep() -> void:
+	if _targets.size() != 1:
 		return
-	var total := _targets.size()
-	var done := 0
-	var uploaded := 0
-	for a in _targets:
-		var local := await DeviceMedia.materialize(a)
-		if local != "":
-			var name := str(a.get("display_name", local.get_file()))
-			var media_type := "video" if a.get("is_video", false) else "image"
-			var r: Dictionary = await Api.upload_asset(local, name, media_type, _as_int(a.get("taken_at")), album_id)
-			DeviceMedia.remove_temp(local)
-			if not r.has("error"):
-				uploaded += 1
-		done += 1
-		notice.emit("上传 %d/%d" % [done, total])
-	if uploaded < total:
-		notice.emit("已上传 %d/%d 项" % [uploaded, total])
+	var id := _keep_target_id(_targets[0])
+	if id <= 0:
+		notice.emit("该项还没有云端副本可保留")
+		return
+	var keep := not Store.is_kept(id)
+	Store.set_kept(id, keep)
+	if keep:
+		notice.emit("已标记保留：本机删除后云端保留")
 	else:
-		notice.emit("已上传 %d 项到红泥相册" % uploaded)
-	changed.emit([], "upload")
+		notice.emit("已取消保留标记")
+	changed.emit([id], "keep")
+
+
+# --- 从本机删除 (device media) -----------------------------------------------
+
+## Removes the device's own files. Android raises a system confirmation (an app
+## may not silently delete another app's media), so the outcome is read back
+## from a fresh scan: whatever is gone is gone, and a declined dialog simply
+## leaves everything in place.
+func _delete_device_items() -> void:
+	var items: Array = []
+	for a in _targets:
+		if DeviceMedia.is_device(a):
+			items.append(a)
+	if items.is_empty():
+		return
+	var gone := await DeviceMedia.delete_items(items)
+	if gone.is_empty():
+		notice.emit("未从本机删除任何项（已取消或失败）")
+	elif gone.size() < items.size():
+		notice.emit("已从本机删除 %d/%d 项；未标记保留的云端副本会在下次同步一并删除"
+			% [gone.size(), items.size()])
+	else:
+		notice.emit("已从本机删除 %d 项；未标记保留的云端副本会在下次同步一并删除" % gone.size())
+	changed.emit([], "device")
+
+
+# --- 移动 / 复制 --------------------------------------------------------------
+
+## 移动到 / 复制到: pick a destination. `Callable.bind()` appends its arguments
+## *after* the call-time ones, so the bound flag is the callback's LAST
+## parameter, not its first.
+func _prompt_target(move: bool) -> void:
+	await _prompt_album("移动到" if move else "复制到", PICK_TARGET, _apply_move_copy.bind(move))
+
+
+## 设为相册封面: any cloud image can be the cover of any album of the active
+## trunk — including the album it is already in.
+func _prompt_cover() -> void:
+	await _prompt_album("设为相册封面", PICK_COVER, _apply_cover)
+
+
+## Target chooser shared by 移动/复制 and 设为相册封面. Every option carries a
+## descriptor ({kind, trunk, id, label}) rather than a bare album id, because a
+## destination can now be a whole trunk or the device gallery as well.
+func _prompt_album(title: String, pick: int, on_confirm: Callable) -> void:
+	var r: Dictionary = await Api.list_albums()
+	if r.has("error"):
+		notice.emit("无法获取相册列表")
+		return
+	var albums: Array = r["data"]["albums"]
+	var options: Array = _sub_album_options(albums, pick == PICK_TARGET)
+	if pick == PICK_TARGET:
+		var device_source := DeviceMedia.is_device(_targets[0])
+		options = _trunk_options(device_source) + options
+	if options.is_empty():
+		notice.emit("没有可选的相册")
+		return
+
+	var popup := AcceptDialog.new()
+	popup.title = title
+	var opt := OptionButton.new()
+	for o in options:
+		opt.add_item(str(o["label"]))
+		opt.set_item_metadata(opt.item_count - 1, o)
+	popup.add_child(opt)
+	_host.add_child(popup)
+	# The dialog takes its width from the dropdown, so this is what keeps long
+	# album names from being clipped.
+	opt.custom_minimum_size.x = _picker_width(opt, options)
+	popup.confirmed.connect(_on_album_picked.bind(opt, popup, on_confirm))
+	popup.canceled.connect(popup.queue_free)
+	popup.popup_centered()
+
+
+## The two cloud trunks as destinations. A single file dropped on a trunk lands
+## in that trunk's 散照; a device item going to 红泥 keeps its device album
+## grouping instead (a separate album per device album).
+func _trunk_options(device_source: bool) -> Array:
+	var out: Array = [{
+		"kind": TargetKind.TRUNK,
+		"trunk": Api.TRUNK_CLOUD,
+		"label": "红泥相册" + ("（按本机相册归位）" if device_source else "（散照）"),
+	}, {
+		"kind": TargetKind.TRUNK,
+		"trunk": Api.TRUNK_PRIVATE,
+		"label": "隐私相册（散照）",
+	}]
+	if not device_source:
+		out.append({
+			"kind": TargetKind.DEVICE,
+			"trunk": "",
+			"label": "系统相册（存到 Pictures/%s）" % EXPORT_DIR_NAME,
+		})
+	return out
+
+
+## Real sub-albums of the trunk on screen (the trunk itself is the 全部
+## aggregation and 收藏 is auto-managed, so neither is a destination).
+func _sub_album_options(albums: Array, exclude_current: bool) -> Array:
+	var out: Array = []
+	for a in albums:
+		var pid = a.get("parent_id")
+		if pid == null or _as_int(pid) != Api.current_trunk_id:
+			continue
+		if str(a.get("name", "")) == FAVORITE:
+			continue
+		if exclude_current and _as_int(a["id"]) == Api.current_album_id:
+			continue
+		out.append({
+			"kind": TargetKind.ALBUM,
+			"trunk": "",
+			"id": _as_int(a["id"]),
+			"label": str(a.get("name", "")),
+		})
+	return out
+
+
+## Width a single-choice dropdown needs so long names are not clipped: the
+## longest label measured in the dropdown's own font, and never less than
+## PICKER_MIN_NAME_SAMPLE measures (7 CJK characters). Measuring one glyph would
+## miss the font's CJK fallback, so the floor comes from measuring the sample
+## string instead. Shared with the album browser's move picker.
+static func picker_width(opt: OptionButton, labels: Array) -> float:
+	var font := opt.get_theme_font("font")
+	if font == null:
+		return 0.0
+	var size := opt.get_theme_font_size("font_size")
+	var w := font.get_string_size(PICKER_MIN_NAME_SAMPLE, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
+	for l in labels:
+		w = maxf(w, font.get_string_size(str(l), HORIZONTAL_ALIGNMENT_LEFT, -1, size).x)
+	return w + PICKER_CHROME_PX
+
+
+func _picker_width(opt: OptionButton, options: Array) -> float:
+	var labels: Array = []
+	for o in options:
+		labels.append(str(o["label"]))
+	return picker_width(opt, labels)
+
+
+func _on_album_picked(opt: OptionButton, popup: AcceptDialog, on_confirm: Callable) -> void:
+	var target = opt.get_item_metadata(opt.selected)
+	if is_instance_valid(popup):
+		popup.queue_free()
+	if target is Dictionary and not target.is_empty():
+		on_confirm.call(target)
+
+
+## Applies 移动/复制 to `target` (see TargetKind). The three source/destination
+## pairings mean different things:
+##   device -> cloud   upload (and, for 移动, remove the device's own file),
+##   cloud  -> cloud   album membership: add to the destination, and for 移动
+##                     detach from the album being viewed,
+##   cloud  -> device  export a copy into Pictures/红泥 (and, for 移动, soft-delete
+##                     the cloud asset).
+func _apply_move_copy(target: Dictionary, move: bool) -> void:
+	var kind := int(target.get("kind", TargetKind.ALBUM))
+	var trunk := str(target.get("trunk", Api.TRUNK_CLOUD))
+	# Writing into 隐私相册 without unlocking would put content behind a gate the
+	# user never passed; everything else stays ungated, as before.
+	if kind == TargetKind.TRUNK and trunk == Api.TRUNK_PRIVATE and not await Lock.require_unlock():
+		return
+	var device_source := DeviceMedia.is_device(_targets[0])
+	var ids: Array = []
+	var pushed: Array = []
+	var failed := 0
+
+	for a in _targets:
+		if DeviceMedia.is_device(a):
+			if kind == TargetKind.DEVICE:
+				continue  # already on the device
+			var album_id := await Api.resolve_scatter_album(trunk)
+			if trunk == Api.TRUNK_CLOUD:
+				album_id = await Api.resolve_device_album(str(a.get("bucket_name", "")))
+			# Backs the item up into `album_id` and links it in the sync index, so
+			# the grid marks it ☁ 已备份 and the next sync leaves it alone. Bytes
+			# the cloud already holds are linked rather than sent again; the
+			# device's own file is never touched here.
+			var up: Dictionary = await Sync.upload_device_item(a, album_id)
+			if int(up.get("asset_id", 0)) > 0:
+				pushed.append(a)
+				ids.append(DeviceMedia.key_of(a))
+			else:
+				failed += 1
+			continue
+		var asset_id := _as_int(a.get("id"))
+		if asset_id <= 0:
+			continue
+		if kind == TargetKind.DEVICE:
+			if await export_to_device([a], move) > 0:
+				ids.append(asset_id)
+			else:
+				failed += 1
+			continue
+		var album_id := _as_int(target.get("id")) if kind == TargetKind.ALBUM \
+			else await Api.resolve_scatter_album(trunk)
+		if album_id > 0 and await _attach(asset_id, album_id, move):
+			ids.append(asset_id)
+		else:
+			failed += 1
+
+	# 移动 out of the device gallery only deletes the device's own file once the
+	# cloud copy actually exists.
+	var moved_out := 0
+	if device_source and move and not pushed.is_empty():
+		moved_out = (await DeviceMedia.delete_items(pushed)).size()
+
+	var done := ids.size() - (pushed.size() - moved_out)
+	var verb := "移动" if move else "复制"
+	var where := str(target.get("label", ""))
+	var text := "已%s %d 项到 %s" % [verb, done, where]
+	if failed > 0:
+		text += "（%d 项失败）" % failed
+	if device_source and move and pushed.size() > moved_out:
+		text += "；本机文件未删除 %d 项" % (pushed.size() - moved_out)
+	notice.emit(text)
+	changed.emit(ids, "device" if device_source else ("move" if move else "copy"))
+
+
+## Adds `asset_id` to `album_id`, and detaches it from the album being viewed
+## when this is a 移动. Returns false only when the destination could not be set.
+func _attach(asset_id: int, album_id: int, move: bool) -> bool:
+	var r: Dictionary = await Api.add_asset_to_album(album_id, asset_id)
+	if r.has("error"):
+		return false
+	if move:
+		var src := _as_int(_source_album.call()) if _source_album.is_valid() else 0
+		if src > 0 and src != album_id:
+			await Api.remove_asset_from_album(src, asset_id)
+	return true
+
+
+# --- cloud -> device ---------------------------------------------------------
+
+## Copies cloud assets into the device gallery under Pictures/红泥 (Sync owns the
+## transfer; this only reports it). With `move` the cloud copy is soft-deleted
+## into the recycle bin. Returns how many files were written.
+func export_to_device(assets: Array, move: bool) -> int:
+	var r: Dictionary = await Sync.export_assets_to_device(assets, move)
+	var written := int(r.get("written", 0))
+	if written > 0:
+		notice.emit("已存到系统相册 %d 项" % written)
+	elif int(r.get("skipped_video", 0)) > 0:
+		notice.emit("视频暂不支持存到相册")
+	return written
 
 
 # --- Detail sheet ------------------------------------------------------------
@@ -281,7 +584,11 @@ func _load_favorites() -> void:
 	Cache.snapshot_album_assets(fav_id, list)
 
 
-## Adds the targets that are not favorites yet, removes those that are.
+## Adds the targets that are not favorites yet, removes those that are. A failed
+## call (usually offline) is reported and leaves the menu's own state alone —
+## otherwise the label would claim a change that never happened. Un-starring a
+## photo that no album holds any more parks it in that trunk's 散照, which is
+## worth saying out loud: nothing was deleted, it just stopped being filed.
 func _toggle_favorite() -> void:
 	var fav_id := Api.favorite_album_id
 	if fav_id <= 0:
@@ -293,129 +600,49 @@ func _toggle_favorite() -> void:
 			add = true
 			break
 	var ids: Array = []
+	var parked := 0
+	var failed := 0
 	for a in _targets:
 		var id := _as_int(a.get("id"))
 		if id <= 0 or _favorite_ids.has(str(id)) == add:
 			continue
+		var r: Dictionary
 		if add:
-			await Api.add_asset_to_album(fav_id, id)
+			r = await Api.add_asset_to_album(fav_id, id)
+		else:
+			r = await Api.remove_asset_from_album(fav_id, id)
+		if r.has("error"):
+			failed += 1
+			continue
+		if add:
 			_favorite_ids[str(id)] = true
 		else:
-			await Api.remove_asset_from_album(fav_id, id)
 			_favorite_ids.erase(str(id))
+			if bool(r.get("data", {}).get("parked", false)):
+				parked += 1
 		ids.append(id)
+	if failed > 0:
+		notice.emit("收藏操作失败 %d 项（离线？稍后再试）" % failed)
+	if parked > 0:
+		notice.emit("已取消收藏；%d 项已不属于任何相册，移到 散照 里" % parked)
 	if not ids.is_empty():
 		changed.emit(ids, "favorite")
 
 
-# --- 移动到 / 复制到 / 设为相册封面 -------------------------------------------
-
-## 移动到 / 复制到: pick a sub-album of the active trunk, excluding the album the
-## photos are being moved out of. The picker calls the confirmation as
-## `on_confirm.call(target_id)`, and `Callable.bind()` appends its arguments
-## *after* the call-time ones — so the bound flag is the callback's LAST
-## parameter, not its first (reversed, it made 移动 add to album 1 and 复制到
-## remove the photo from its source without adding it anywhere).
-func _prompt_target(move: bool) -> void:
-	await _prompt_album("移动到相册" if move else "复制到相册", true, _apply_move_copy.bind(move))
-
-
-## 设为相册封面: any cloud image can be the cover of any album of the active
-## trunk — including the album it is already in.
-func _prompt_cover() -> void:
-	await _prompt_album("设为相册封面", false, _apply_cover)
-
-
-## Album chooser shared by 移动到 / 复制到 / 设为相册封面. Offers the sub-albums of
-## the active trunk (the trunk itself is the 全部 aggregation and 收藏 is
-## auto-managed, so neither is a target) and calls `on_confirm` with the chosen
-## album id.
-func _prompt_album(title: String, exclude_current: bool, on_confirm: Callable) -> void:
-	var r: Dictionary = await Api.list_albums()
-	if r.has("error"):
-		notice.emit("无法获取相册列表")
-		return
-	var options: Array = []
-	for a in r["data"]["albums"]:
-		var pid = a.get("parent_id")
-		if pid == null or _as_int(pid) != Api.current_trunk_id:
-			continue
-		if str(a.get("name", "")) == FAVORITE:
-			continue
-		if exclude_current and _as_int(a["id"]) == Api.current_album_id:
-			continue
-		options.append(a)
-	if options.is_empty():
-		notice.emit("没有可选的相册")
-		return
-
-	var popup := AcceptDialog.new()
-	popup.title = title
-	var opt := OptionButton.new()
-	for a in options:
-		opt.add_item(str(a["name"]))
-		opt.set_item_metadata(opt.item_count - 1, _as_int(a["id"]))
-	popup.add_child(opt)
-	_host.add_child(popup)
-	# The dialog takes its width from the dropdown, so this is what keeps long
-	# album names from being clipped.
-	opt.custom_minimum_size.x = _picker_width(opt, options)
-	popup.confirmed.connect(_on_album_picked.bind(opt, popup, on_confirm))
-	popup.canceled.connect(popup.queue_free)
-	popup.popup_centered()
-
-
-## Width the picker needs: the longest album name in the dropdown's own font,
-## and never less than PICKER_MIN_NAME_SAMPLE measures (7 CJK characters). A
-## single glyph measured with get_char_size misses the font's CJK fallback, so
-## the floor comes from measuring the sample string instead.
-func _picker_width(opt: OptionButton, options: Array) -> float:
-	var font := opt.get_theme_font("font")
-	if font == null:
-		return 0.0
-	var size := opt.get_theme_font_size("font_size")
-	var w := font.get_string_size(PICKER_MIN_NAME_SAMPLE, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
-	for a in options:
-		w = maxf(w, font.get_string_size(str(a.get("name", "")), HORIZONTAL_ALIGNMENT_LEFT, -1, size).x)
-	return w + PICKER_CHROME_PX
-
-
-func _on_album_picked(opt: OptionButton, popup: AcceptDialog, on_confirm: Callable) -> void:
-	var target_id := _as_int(opt.get_item_metadata(opt.selected))
-	if is_instance_valid(popup):
-		popup.queue_free()
-	if target_id > 0:
-		on_confirm.call(target_id)
-
-
-## `move` is the bound flag (last parameter — see _prompt_target); `target_id`
-## is what the picker passed.
-func _apply_move_copy(target_id: int, move: bool) -> void:
-	var source := _as_int(_source_album.call()) if _source_album.is_valid() else 0
-	var ids: Array = []
-	for a in _targets:
-		var id := _as_int(a.get("id"))
-		if id <= 0:
-			continue
-		await Api.add_asset_to_album(target_id, id)
-		if move and source > 0:
-			await Api.remove_asset_from_album(source, id)
-		ids.append(id)
-	if not ids.is_empty():
-		changed.emit(ids, "move" if move else "copy")
-
+# --- 设为相册封面 -------------------------------------------------------------
 
 ## 设为相册封面: recorded on this device only (settings.json `album_covers`) — the
 ## server keeps no cover, so the choice does not travel to other devices and the
 ## album's membership is untouched. Nothing on screen changes here (album cards
 ## live in the album list, which reads the choice when it opens), so no `changed`.
-func _apply_cover(target_id: int) -> void:
+func _apply_cover(target: Dictionary) -> void:
 	if _targets.size() != 1:
 		return
 	var id := _as_int(_targets[0].get("id"))
-	if id <= 0:
+	var album_id := _as_int(target.get("id"))
+	if id <= 0 or album_id <= 0:
 		return
-	Store.set_album_cover(target_id, id)
+	Store.set_album_cover(album_id, id)
 	notice.emit("已设为相册封面")
 
 

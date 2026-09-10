@@ -223,8 +223,6 @@ func _refresh_grid() -> void:
 	# 离线/弱联是主线: 先用本地缓存立即铺网格(不等待网络);云端在后台线程
 	# 刷新,返回后再替换。这样即使云不可达,网格也即时出现。
 	var cached := Cache.offline_assets(_album_id, _filter)
-	if _is_all:
-		cached = _with_local_pending(cached, _filter == "videos")
 	Api.viewer_assets = cached
 	_assets_full = cached
 	_render_cells(0)
@@ -245,8 +243,6 @@ func _update_from_cloud() -> void:
 		return
 	_set_mode_status(false)
 	var list: Array = res["assets"]
-	if _is_all:
-		list = _with_local_pending(list, _filter == "videos")
 	Api.viewer_assets = list
 	_clear_grid()
 	_assets_full = list
@@ -296,8 +292,7 @@ func _add_cell(a: Dictionary, index: int, gen: int) -> void:
 		_add_device_cell(a, index)
 		return
 	var asset_id := int(a.get("id", 0))
-	if asset_id <= 0 and a.has("local_path"):
-		_add_local_cell(a, index)
+	if asset_id <= 0:
 		return
 	var btn := TextureButton.new()
 	btn.custom_minimum_size = Vector2(THUMB_SIZE, THUMB_SIZE)
@@ -326,25 +321,6 @@ func _add_cell(a: Dictionary, index: int, gen: int) -> void:
 	_load_cell_thumb(btn, asset_id, gen, str(a.get("media_type", "image")))
 
 
-## A local-only (not yet uploaded) photo cell, shown only in the 全部 view with
-## an ↑ upload badge. Tapping it uploads the file into the trunk's 散照 bucket.
-func _add_local_cell(a: Dictionary, index: int) -> void:
-	var path := str(a.get("local_path", ""))
-	var btn := Button.new()
-	btn.custom_minimum_size = Vector2(THUMB_SIZE, THUMB_SIZE)
-	btn.text = (str(a.get("original_name", "")) + "\n↑ 待上传")
-	btn.set_meta("local_path", path)
-	btn.pressed.connect(_upload_local.bind(path))
-	grid.add_child(btn)
-
-
-func _upload_local(path: String) -> void:
-	var name := path.get_file()
-	var media_type := "video" if _is_video(name) else "image"
-	await Api.upload_asset(path, name, media_type, int(FileAccess.get_modified_time(path)), _upload_album_id())
-	_refresh_grid.call_deferred()
-
-
 ## A device (系统相册) cell: same shape as a cloud cell — checkbox, ▶ badge for
 ## videos, long-press → multi-select, tap → viewer — but the thumbnail comes from
 ## the device and tapping opens the viewer instead of uploading.
@@ -367,6 +343,10 @@ func _add_device_cell(a: Dictionary, index: int) -> void:
 	# Videos carry no server thumbnail; the centered ▶ identifies them.
 	if a.get("is_video", false):
 		_add_badge(btn, "▶", Vector2.ZERO, true)
+	# ☁ marks an item already backed up to the cloud: the sync engine skips it,
+	# and it is what the cell's cloud state reduces to.
+	if Sync.backed_up_asset_id(a) > 0:
+		_add_badge(btn, "☁")
 	_cell_by_key[key] = btn
 	_request_device_thumb(a)
 
@@ -431,46 +411,6 @@ func _is_selectable(a: Dictionary) -> bool:
 	if DeviceMedia.is_device(a):
 		return true
 	return int(a.get("id", 0)) > 0
-
-
-## Local files under user://photos not yet uploaded to the cloud (no sync-index
-## cloud id). Merged into the 全部 / 视频 grid with an ↑ upload badge;
-## `videos_only` keeps just the video files (the 视频 view).
-func _local_pending(videos_only: bool = false) -> Array:
-	var out: Array = []
-	var dir := DirAccess.open("user://photos")
-	if dir == null:
-		return out
-	dir.list_dir_begin()
-	var n := dir.get_next()
-	while n != "":
-		if not dir.current_is_dir() and not n.begins_with("."):
-			if videos_only and not _is_video(n):
-				n = dir.get_next()
-				continue
-			var local_id := "photos/" + n
-			var e := Store.find_index_entry(local_id)
-			var uploaded := false
-			if not e.is_empty():
-				uploaded = int(e.get("cloud_asset_id", 0)) > 0 and not e.get("deleted", false)
-			if not uploaded:
-				out.append({
-					"local_path": "user://photos/" + n,
-					"original_name": n,
-					"id": 0,
-				})
-		n = dir.get_next()
-	dir.list_dir_end()
-	return out
-
-
-func _with_local_pending(list: Array, videos_only: bool = false) -> Array:
-	var pending := _local_pending(videos_only)
-	if pending.is_empty():
-		return list
-	var merged := pending
-	merged.append_array(list)
-	return merged
 
 
 ## Overlays a small badge on a cell: cloud download ⇩ / upload ⇧ at top-right
@@ -729,12 +669,6 @@ func _all_selected() -> bool:
 
 
 func _sync_cell_select(cell: Node) -> void:
-	if cell.has_meta("local_path"):
-		# Local-only (not yet uploaded) cell: its tap uploads, so keep it out of
-		# select mode rather than let it be mistaken for a selectable photo.
-		if cell is BaseButton:
-			cell.disabled = _select_mode
-		return
 	var key := _cell_key(cell)
 	if key == "":
 		return
@@ -789,34 +723,18 @@ func _on_menu_changed(_ids: Array, op: String) -> void:
 	_ctx_asset = {}
 	if _select_mode:
 		_set_select_mode(false)
-	if op == "upload":
-		# 上传 copies into the cloud: the device album itself is unchanged, so
-		# keep the grid (and the notice it just showed) as they are.
-		return
 	if not _is_device:
 		_refresh_grid.call_deferred()
+		return
+	# Any device-side action (导入/删除/移动) changes what the device lists and
+	# which cells are ☁ 已备份: re-render, keeping the notice that just came in.
+	var notice := _base_status
+	_refresh_device_grid()
+	_set_mode_status(false, notice)
 
 
 func _on_menu_notice(text: String) -> void:
 	_set_mode_status(false, text)
-
-
-# --- Upload (PC file dialog / Android photo picker) --------------------------
-
-## Upload target: the current album; for the 全部 aggregate view the trunk's
-## 散照 bucket (the data-layer home for un-orphaned photos).
-func _upload_album_id() -> int:
-	if _is_all:
-		return Api.scatter_album_id
-	return _album_id
-
-
-func _is_video(name: String) -> bool:
-	match name.get_extension().to_lower():
-		"mp4", "mov", "mkv", "webm":
-			return true
-		_:
-			return false
 
 
 # --- Misc --------------------------------------------------------------------

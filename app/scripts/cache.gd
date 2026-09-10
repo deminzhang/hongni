@@ -14,18 +14,14 @@ extends Node
 ## 1024 = 1 GiB), cached originals are deleted in least-recently-viewed order
 ## until free space is back above the threshold. Thumbnails always remain.
 ## Only cloud-backed originals live here (every entry is downloaded from the
-## server by cloud asset id), so deletion never loses the only copy.
-##
-## user://photos (the two_way/mirror authoritative sync dir) is deliberately
-## never touched: this cache is 100 % disposable.
+## server by cloud asset id), so deletion never loses the only copy. The device
+## gallery is never touched: it belongs to the user and to the system gallery
+## app, and this cache is 100 % disposable.
 
 const CACHE_DIR := "user://cache"
 const THUMB_DIR := CACHE_DIR + "/thumbs"
 const ORIG_DIR := CACHE_DIR + "/originals"
 const CATALOG_PATH := CACHE_DIR + "/catalog.json"
-# User photos live here as an upload source; space pressure may drop already
-# backed-up originals (cloud keeps the authoritative copy) to reclaim room.
-const PHOTOS_DIR := "user://photos"
 
 const MB := 1024 * 1024
 
@@ -291,35 +287,6 @@ func enforce_cache() -> void:
 			break
 		if DirAccess.remove_absolute(it["path"]) == OK:
 			free = free_space_bytes()
-
-	# Once cached originals are gone, also drop already-backed-up photos sources
-	# (user://photos) — the cloud keeps the authoritative copy, so only the
-	# thumbnail remains locally. Un-backed-up files are never touched.
-	if free < threshold:
-		free = _trim_photos_sources(free, threshold)
-
-
-## Deletes user://photos originals that have already been backed up (present in
-## the sync index and not tombstoned) to reclaim space, returning the new free
-## space. Thumbnails and un-backuped files are preserved.
-func _trim_photos_sources(free: int, threshold: int) -> int:
-	var dir := DirAccess.open(PHOTOS_DIR)
-	if dir == null:
-		return free
-	dir.list_dir_begin()
-	var n := dir.get_next()
-	while n != "":
-		if free >= threshold:
-			break
-		if not dir.current_is_dir() and not n.begins_with("."):
-			var local_id := "photos/" + n
-			var e := Store.find_index_entry(local_id)
-			if not e.is_empty() and not e.get("deleted", false):
-				if DirAccess.remove_absolute(PHOTOS_DIR + "/" + n) == OK:
-					free = free_space_bytes()
-		n = dir.get_next()
-	dir.list_dir_end()
-	return free
 
 
 ## Cache stats for the settings screen: {count, bytes}.

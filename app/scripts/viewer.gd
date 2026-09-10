@@ -58,7 +58,6 @@ const ASSET_MENU := preload("res://scripts/asset_menu.gd")
 
 var top_bar: HBoxContainer
 var bottom_row: HBoxContainer
-var label_name: Label
 var label_status: Label
 var texture_rect: TextureRect
 var btn_delete: Button
@@ -146,10 +145,6 @@ func _build_ui() -> void:
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	spacer.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	top_bar.add_child(spacer)
-
-	label_name = Label.new()
-	label_name.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(label_name)
 
 	texture_rect = TextureRect.new()
 	texture_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
@@ -297,7 +292,6 @@ func _show_current() -> void:
 	asset_menu.close_details()
 	if Api.viewer_assets.is_empty() or Api.viewer_index < 0 or Api.viewer_index >= Api.viewer_assets.size():
 		texture_rect.texture = null
-		label_name.text = "（无）"
 		label_status.text = ""
 		return
 	var a: Dictionary = Api.viewer_assets[Api.viewer_index]
@@ -308,7 +302,6 @@ func _show_current() -> void:
 	if asset_id <= 0:
 		# Local-only (not yet uploaded) photo: show a hint, nothing to fetch.
 		texture_rect.texture = null
-		label_name.text = str(a.get("original_name", ""))
 		label_status.text = "本地待上传 · 尚未同步到云端"
 		return
 	btn_delete.visible = true
@@ -316,7 +309,6 @@ func _show_current() -> void:
 	var ext := str(a.get("ext", ""))
 	var mime: String = a.get("mime_type", "image/jpeg")
 	var media_type := str(a.get("media_type", "image"))
-	label_name.text = "%d  %s" % [asset_id, name]
 	texture_rect.texture = null
 	Cache.mark_viewed(asset_id)
 	btn_save.visible = OS.get_name() == "Android" and media_type != "video"
@@ -377,7 +369,6 @@ func _show_current() -> void:
 func _show_device_current(a: Dictionary) -> void:
 	btn_delete.visible = false
 	btn_save.visible = false
-	label_name.text = str(a.get("display_name", ""))
 	texture_rect.texture = null
 	if a.get("is_video", false):
 		label_status.text = "视频"
@@ -631,14 +622,13 @@ func _delete_current() -> void:
 
 # --- Surrounding UI ----------------------------------------------------------
 
-## Hides/shows everything around the picture: top bar, name/status, the video
+## Hides/shows everything around the picture: top bar, status line, the video
 ## transport and the action row. Used for full-bleed viewing of an image, and
 ## for a playing video ("再点一下隐藏/显示周边操作 UI").
 func _set_chrome_visible(show: bool) -> void:
 	_chrome_visible = show
 	top_bar.visible = show
 	bottom_row.visible = show
-	label_name.visible = show
 	label_status.visible = show
 	_refresh_transport()
 
@@ -768,8 +758,9 @@ func _move_source_album() -> int:
 ## 收藏/复制/改名 leave the photo where it is; 删除 and 移动到 (outside the 全部
 ## aggregation) drop it from the album being viewed, so the viewer moves on.
 func _on_menu_changed(ids: Array, op: String) -> void:
-	if op == "upload":
-		# The device file is unchanged by 上传; keep its notice on screen.
+	if op == "device":
+		# 导入/删除/移动 都可能把当前这张从本机带走；别的云端操作不动画面。
+		_drop_missing_device_items()
 		return
 	if op != "delete" and op != "move":
 		_show_current()
@@ -789,17 +780,30 @@ func _on_menu_changed(ids: Array, op: String) -> void:
 	_show_current()
 
 
+## Drops device items the device no longer lists (a 删除/移动 from the menu can
+## take the photo being viewed with it) and moves the viewer on.
+func _drop_missing_device_items() -> void:
+	var live: Dictionary = {}
+	for it in DeviceMedia.items():
+		live[DeviceMedia.key_of(it)] = true
+	var keep: Array = []
+	for a in Api.viewer_assets:
+		if DeviceMedia.is_device(a) and not live.has(DeviceMedia.key_of(a)):
+			continue
+		keep.append(a)
+	if keep.size() == Api.viewer_assets.size():
+		_show_current()
+		return
+	Api.viewer_assets = keep
+	if Api.viewer_assets.is_empty():
+		_go_back()
+		return
+	Api.viewer_index = clampi(Api.viewer_index, 0, Api.viewer_assets.size() - 1)
+	_show_current()
+
+
 func _on_menu_notice(text: String) -> void:
 	label_status.text = text
-
-
-func _ext_for_mime(mime: String) -> String:
-	match mime:
-		"image/png": return "png"
-		"image/webp": return "webp"
-		"image/gif": return "gif"
-		"image/bmp": return "bmp"
-		_: return "jpg"
 
 
 ## The mp4 is served by the cloud behind a Bearer token, so it is downloaded to
@@ -938,60 +942,16 @@ func _process(delta: float) -> void:
 		texture_rect.texture = ImageTexture.create_from_image(img)
 
 
-## Saves the current image's full-res bytes into the device system album
-## (Pictures/Hongni) via the Android plugin. Uses the cached original when
-## present, otherwise downloads it first.
+## Saves the current asset's full-res bytes into the device gallery. The export
+## itself lives in the asset menu, which the grid's 复制到/移动到 reuse — one
+## implementation, one set of notices, and it works on desktop too.
 func _save_to_album() -> void:
-	var a: Dictionary = Api.viewer_assets[Api.viewer_index]
-	if str(a.get("media_type", "image")) == "video":
-		label_status.text = "视频暂不支持存到相册"
-		return
-	if OS.get_name() != "Android":
+	var a := _current_asset()
+	if a.is_empty() or int(a.get("id", 0)) <= 0:
 		return
 	btn_save.disabled = true
-	var asset_id := int(a.get("id", 0))
-	var name := str(a.get("original_name", ""))
-	# The server records the original extension at upload, so it survives a
-	# later rename that strips the extension from the display name.
-	var ext := str(a.get("ext", ""))
-	var mime := str(a.get("mime_type", ""))
-	if mime == "":
-		mime = "image/jpeg"
-	var body := Cache.read_original(asset_id, name, ext)
-	if body.is_empty():
-		var r: Dictionary = await Api.fetch_original(asset_id)
-		if r.has("error"):
-			label_status.text = "保存失败：无法获取原图"
-			btn_save.disabled = false
-			return
-		body = r["body"]
-		await Cache.save_original_bg(asset_id, name, body, ext)
-	if body.is_empty():
-		label_status.text = "保存失败：无数据"
-		btn_save.disabled = false
-		return
-	# Give the gallery copy a real extension: prefer the recorded one, else the
-	# display name's, else one derived from the MIME type. Only rewrite the
-	# display name when it is extension-less, so a well-formed name is kept.
-	if ext == "":
-		ext = name.get_extension().to_lower()
-	if ext == "":
-		ext = _ext_for_mime(mime)
-	if name.get_extension().to_lower() == "":
-		name = (name.get_basename() + "." + ext) if name.get_basename() != "" else "hongni_%d.%s" % [asset_id, ext]
-	label_status.text = "保存中…"
-	var tmp := "user://hongni_save_tmp_%d.%s" % [asset_id, ext]
-	var f := FileAccess.open(tmp, FileAccess.WRITE)
-	if f == null:
-		label_status.text = "保存失败：无法写入临时文件"
-		btn_save.disabled = false
-		return
-	f.store_buffer(body)
-	f.close()
-	var ok := Lock.save_to_gallery(ProjectSettings.globalize_path(tmp), name, mime)
-	DirAccess.remove_absolute(ProjectSettings.globalize_path(tmp))
+	await asset_menu.export_to_device([a], false)
 	btn_save.disabled = false
-	label_status.text = "已保存到系统相册" if ok else "保存失败"
 
 
 func _go_back() -> void:

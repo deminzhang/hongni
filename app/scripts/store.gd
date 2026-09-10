@@ -15,8 +15,17 @@ var settings: Dictionary = {
 	"pending_deletes": [],
 	# Album covers this device picked: album id (String) -> asset id (int).
 	"album_covers": {},
+	# Cloud assets pinned against the device-delete mirror: asset id (String) ->
+	# true. Deleting a photo from the system gallery normally deletes the cloud
+	# copy too; pinning is the explicit "本机删掉、云端留着" opt-out.
+	"keep_assets": {},
 }
 var sync_index: Array = []
+# sync_index keyed by local_id, rebuilt lazily after any mutation. A sync looks
+# an entry up once per scanned file, and the device gallery holds thousands, so
+# a linear scan there would make the whole pass quadratic.
+var _index_by_id: Dictionary = {}
+var _index_stale := true
 
 # Index into servers() of the node that answered last: requests try it first,
 # then the remaining nodes in priority order. Volatile (never persisted), so a
@@ -166,6 +175,29 @@ func set_album_cover(album_id: int, asset_id: int) -> void:
 	save_settings()
 
 
+## Whether cloud asset `asset_id` is pinned against the device-delete mirror —
+## i.e. the user asked for it to outlive the device file.
+func is_kept(asset_id: int) -> bool:
+	var kept = settings.get("keep_assets", {})
+	return kept is Dictionary and kept.has(str(asset_id))
+
+
+## Pins or unpins `asset_id` and returns the resulting state.
+func set_kept(asset_id: int, keep: bool) -> bool:
+	if asset_id <= 0:
+		return false
+	var kept = settings.get("keep_assets", {})
+	if not (kept is Dictionary):
+		kept = {}
+	if keep:
+		kept[str(asset_id)] = true
+	else:
+		kept.erase(str(asset_id))
+	settings["keep_assets"] = kept
+	save_settings()
+	return keep
+
+
 func load_sync_index() -> void:
 	if FileAccess.file_exists(SYNC_INDEX_PATH):
 		var f := FileAccess.open(SYNC_INDEX_PATH, FileAccess.READ)
@@ -174,6 +206,7 @@ func load_sync_index() -> void:
 			if parsed is Array:
 				sync_index = parsed
 			f.close()
+	_index_stale = true
 
 
 func save_sync_index() -> void:
@@ -183,31 +216,70 @@ func save_sync_index() -> void:
 		f.close()
 
 
+## The sync index keyed by local_id (rebuilt after any mutation).
+func _index_by_local_id() -> Dictionary:
+	if _index_stale:
+		_index_by_id.clear()
+		for e in sync_index:
+			_index_by_id[str(e.get("local_id", ""))] = e
+		_index_stale = false
+	return _index_by_id
+
+
 func find_index_entry(local_id: String) -> Dictionary:
-	for e in sync_index:
-		if e.get("local_id", "") == local_id:
+	return _index_by_local_id().get(local_id, {})
+
+
+## Records (or refreshes) the entry for `local_id`. `stamp` is the change
+## detector: the file mtime on desktop, MediaStore's DATE_TAKEN on Android —
+## compared together with `size` to skip sources that have not changed.
+func upsert_index_entry(local_id: String, hash: String, cloud_asset_id: int, media_type: String, stamp: int, size: int) -> void:
+	# The map holds the same Dictionary instances as the array, so mutating the
+	# entry found here updates sync_index in place and the map stays valid.
+	var by_id := _index_by_local_id()
+	var e: Dictionary = by_id.get(local_id, {})
+	if e.is_empty():
+		e = {"local_id": local_id}
+		sync_index.append(e)
+		by_id[local_id] = e
+	e["hash"] = hash
+	e["cloud_asset_id"] = cloud_asset_id
+	e["media_type"] = media_type
+	e["stamp"] = stamp
+	e["size"] = size
+	save_sync_index()
+
+
+## Drops the entry for `local_id` and returns it ({} when there was none).
+func erase_index_entry(local_id: String) -> Dictionary:
+	for i in sync_index.size():
+		if str(sync_index[i].get("local_id", "")) == local_id:
+			var e: Dictionary = sync_index[i]
+			sync_index.remove_at(i)
+			_index_stale = true
+			save_sync_index()
 			return e
 	return {}
 
 
-func upsert_index_entry(local_id: String, hash: String, cloud_asset_id: int, media_type: String, mtime: int, size: int) -> void:
-	var found := false
-	for e in sync_index:
-		if e.get("local_id", "") == local_id:
-			e["hash"] = hash
-			e["cloud_asset_id"] = cloud_asset_id
-			e["media_type"] = media_type
-			e["mtime"] = mtime
-			e["size"] = size
-			found = true
-			break
-	if not found:
-		sync_index.append({
-			"local_id": local_id,
-			"hash": hash,
-			"cloud_asset_id": cloud_asset_id,
-			"media_type": media_type,
-			"mtime": mtime,
-			"size": size,
-		})
+## Drops the entry pointing at cloud asset `cloud_asset_id`, if any, and returns
+## it ({} when the asset has no local source).
+func erase_index_by_cloud_id(cloud_asset_id: int) -> Dictionary:
+	if cloud_asset_id <= 0:
+		return {}
+	for i in sync_index.size():
+		if int(sync_index[i].get("cloud_asset_id", 0)) == cloud_asset_id:
+			var e: Dictionary = sync_index[i]
+			sync_index.remove_at(i)
+			_index_stale = true
+			save_sync_index()
+			return e
+	return {}
+
+
+## Replaces the whole index (bulk migration) and persists it.
+func replace_sync_index(entries: Array) -> void:
+	sync_index = entries
+	_index_stale = true
 	save_sync_index()
+

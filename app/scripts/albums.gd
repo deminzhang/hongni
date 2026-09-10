@@ -1,10 +1,15 @@
 extends Control
-## Album browser: three parallel trunks — 红泥相册 (cloud), 系统相册 (this device's
-## own gallery) and 红泥隐私相册 (cloud, hidden) — switched with the top-bar tabs.
-## Each trunk shows the same multi-column card grid (收藏 / 全部 / 视频 / sub-albums
-## in the cloud trunks, 全部 / 视频 / one card per device album in the system
-## trunk); selecting a card opens album_view.tscn, the one photo grid all three
-## share.
+## Album browser: three parallel trunks — 系统相册 (this device's own gallery, the
+## one the app opens on), 红泥相册 (the cloud backup) and 红泥隐私相册 (cloud,
+## hidden) — switched with the top-bar tabs. Each trunk shows the same
+## multi-column card grid (收藏 / 全部 / 视频 / sub-albums in the cloud trunks,
+## 全部 / 视频 / one card per device album in the system trunk); selecting a card
+## opens album_view.tscn, the one photo grid all three share.
+##
+## 系统相册 is the browsing surface: the device keeps its own storage, its own
+## app still works without hongni, and the cloud shows up as the ☁ 已备份 state
+## on each item plus an album mirroring each device album. 红泥相册 is where the
+## cloud side is managed (albums, favourites, recycle bin).
 ##
 ## The 散照 bucket is retained in the data layer only: it is folded into the
 ## 全部 card (a trunk aggregation) and never shown as a standalone card. The
@@ -14,22 +19,27 @@ extends Control
 ## albums are the device's own and have no menu (tap opens them).
 
 const LONG_PRESS := 0.5
-const TRUNK_ALBUM := "相册"
 const TRUNK_SYSTEM := "系统相册"
-const TRUNK_PRIVATE := "隐私"
 const FAVORITE := "收藏"
 # Virtual cards: 全部 is the trunk itself (server aggregates its members), 视频
 # is that aggregation restricted to videos by the server-side media filter.
 const ALL := "全部"
+# Only for its static dropdown-sizing helper: the move picker must measure names
+# the same way the asset menu's does, and that logic lives in one place.
+const ASSET_MENU := preload("res://scripts/asset_menu.gd")
 const VIDEO := "视频"
 const VIDEO_FILTER := "videos"
-const SCRATCH_BUCKETS := ["散照", "未分类散照"]
 const TRUNK_COLUMNS := 2
 # Card is just the preview icon (mostly) plus a single-line name label.
 const CARD_SIZE := Vector2(336, 322)
 
-enum MenuId { RENAME, DELETE_ALBUM }
+enum MenuId { RENAME, DELETE_ALBUM, MOVE_ALBUM, COPY_ALBUM }
 enum MoreId { TRASH, SYNC, SETTINGS }
+
+## Destination of an album-level 移动/复制: one of the three trunks' roots. An
+## album only ever hangs off a trunk root — its photos are what choose freely
+## between the other trunks' 散件 and this trunk's other sub-albums.
+enum TargetId { CLOUD, PRIVATE, DEVICE }
 
 var card_grid: GridContainer
 var progress: ProgressBar
@@ -41,7 +51,7 @@ var status_label: Label
 var ctx_menu: PopupMenu
 var more_menu: PopupMenu
 
-var current_trunk: String = TRUNK_ALBUM
+var current_trunk: String = TRUNK_SYSTEM
 # True when the album list failed to load (offline / weak cloud). Card previews
 # then read only from the cache and never wait on the network.
 var _offline := false
@@ -55,9 +65,11 @@ var _lp_suppress := false
 var _lp_held := false
 var _lp_token := 0
 
-# Context target for the active album menu.
+# Context target for the active album menu: a cloud album id + name, or a
+# device album's bucket id (empty for a cloud album).
 var _ctx_album_id := 0
 var _ctx_album_name := ""
+var _ctx_device_bucket := ""
 
 
 func _ready() -> void:
@@ -69,18 +81,23 @@ func _ready() -> void:
 	_sync_trunk_state()
 	Cache.enforce_cache()
 	_reload_context.call_deferred()
+	# 红泥相册 / 隐私相册 keep themselves current: entering the album browser pulls
+	# the cloud side (remote changes, queued deletes). The device gallery is only
+	# backed up when the user asks for it — 立即同步.
+	if Store.is_configured():
+		Sync.sync_cloud.call_deferred()
 
 
-## Trunk to re-open on: the one loaded last this session (`Api.current_trunk`).
-## 隐私 only when the session is unlocked — restoring the tab must not slip past
-## the PIN gate. Anything unknown falls back to 红泥相册.
+## Trunk to re-open on: the one loaded last this session (`Api.current_trunk`),
+## which starts on 系统相册. 隐私 only when the session is unlocked — restoring
+## the tab must not slip past the PIN gate.
 func _restore_trunk() -> String:
 	match Api.current_trunk:
-		TRUNK_SYSTEM:
-			return TRUNK_SYSTEM
-		TRUNK_PRIVATE:
-			return TRUNK_PRIVATE if Lock.is_unlocked() else TRUNK_ALBUM
-	return TRUNK_ALBUM
+		Api.TRUNK_CLOUD:
+			return Api.TRUNK_CLOUD
+		Api.TRUNK_PRIVATE:
+			return Api.TRUNK_PRIVATE if Lock.is_unlocked() else TRUNK_SYSTEM
+	return TRUNK_SYSTEM
 
 
 func _process(_dt: float) -> void:
@@ -101,9 +118,9 @@ func _build_ui() -> void:
 	root.add_child(top)
 
 	var trunk_group := ButtonGroup.new()
-	btn_trunk_album = _make_trunk_button(TRUNK_ALBUM, "红泥相册", trunk_group)
+	btn_trunk_album = _make_trunk_button(Api.TRUNK_CLOUD, "红泥相册", trunk_group)
 	btn_trunk_system = _make_trunk_button(TRUNK_SYSTEM, "系统相册", trunk_group)
-	btn_trunk_private = _make_trunk_button(TRUNK_PRIVATE, "隐私相册", trunk_group)
+	btn_trunk_private = _make_trunk_button(Api.TRUNK_PRIVATE, "隐私相册", trunk_group)
 	top.add_child(btn_trunk_album)
 	top.add_child(btn_trunk_system)
 	top.add_child(btn_trunk_private)
@@ -209,12 +226,16 @@ func _on_lp_pressed(btn: BaseButton) -> void:
 
 
 func _on_short_press(btn: BaseButton) -> void:
-	if btn.has_meta("album_id"):
+	if btn.has_meta("device_bucket"):
+		_open_device_album(str(btn.get_meta("device_bucket")), str(btn.get_meta("album_name", "")))
+	elif btn.has_meta("album_id"):
 		_open_album(int(btn.get_meta("album_id")), str(btn.get_meta("album_name", "")), str(btn.get_meta("album_filter", "all")))
 
 
 func _on_long_press(btn: BaseButton) -> void:
-	if btn.has_meta("album_id"):
+	if btn.has_meta("device_bucket"):
+		_show_device_album_menu(str(btn.get_meta("device_bucket")), str(btn.get_meta("album_name", "")))
+	elif btn.has_meta("album_id"):
 		_show_album_menu(int(btn.get_meta("album_id")), str(btn.get_meta("album_name", "")))
 
 
@@ -235,7 +256,7 @@ func _on_trunk(name: String) -> void:
 	if name == current_trunk:
 		return
 	# 红泥隐私相册 is PIN/biometric gated; a refused unlock snaps the tab back.
-	if name == TRUNK_PRIVATE and not await Lock.require_unlock():
+	if name == Api.TRUNK_PRIVATE and not await Lock.require_unlock():
 		_sync_trunk_state()
 		return
 	current_trunk = name
@@ -247,9 +268,9 @@ func _on_trunk(name: String) -> void:
 ## the device trunk has no 新建相册 (its albums belong to the device) and no
 ## 最近删除 (the recycle bin is cloud-side).
 func _sync_trunk_state() -> void:
-	btn_trunk_album.button_pressed = current_trunk == TRUNK_ALBUM
+	btn_trunk_album.button_pressed = current_trunk == Api.TRUNK_CLOUD
 	btn_trunk_system.button_pressed = current_trunk == TRUNK_SYSTEM
-	btn_trunk_private.button_pressed = current_trunk == TRUNK_PRIVATE
+	btn_trunk_private.button_pressed = current_trunk == Api.TRUNK_PRIVATE
 	btn_new.visible = current_trunk != TRUNK_SYSTEM
 	_rebuild_more_menu()
 
@@ -306,14 +327,14 @@ func _reload_context() -> void:
 		if n == FAVORITE:
 			favorite = a
 			Api.favorite_album_id = int(a["id"])
-		elif n in SCRATCH_BUCKETS:
+		elif n in Api.SCRATCH_BUCKETS:
 			Api.scatter_album_id = int(a["id"])
 		else:
 			subs.append(a)
 
 	# Device-gallery uploads always land in 红泥相册 (its 散照 bucket), whichever
 	# trunk is currently on screen; remember it while we have the list at hand.
-	if current_trunk == TRUNK_ALBUM:
+	if current_trunk == Api.TRUNK_CLOUD:
 		Api.import_album_id = Api.scatter_album_id
 
 	# Cards: 收藏 (only when non-empty), 全部 (= trunk aggregation), 视频 (that
@@ -437,17 +458,24 @@ func _reload_device_context() -> void:
 	if not videos.is_empty():
 		_add_device_card(DeviceMedia.VIDEO_BUCKET, VIDEO, videos.size(), DeviceMedia.cover_item(videos))
 	for a in albums:
-		_add_device_card(str(a["id"]), str(a["name"]), int(a["count"]), a["cover"])
+		_add_device_card(str(a["id"]), str(a["name"]), int(a["count"]), a["cover"], true)
 
 
-## One device album card: same card shape as the cloud ones, but tap-only (the
-## device owns these albums, so there is nothing to rename or delete here).
-func _add_device_card(bucket_id: String, name: String, count: int, cover) -> void:
+## One device album card: same card shape as the cloud ones. Real device albums
+## (album_card = true) also answer a long press with the menu that sends them to
+## a cloud trunk — 全部/视频 are virtual aggregations and stay tap-only, as does
+## the album itself being the device's own.
+func _add_device_card(bucket_id: String, name: String, count: int, cover, album_card := false) -> void:
 	var btn := Button.new()
 	btn.custom_minimum_size = CARD_SIZE
 	btn.text = name
 	btn.tooltip_text = "%d 项" % count
-	btn.pressed.connect(_open_device_album.bind(bucket_id, name))
+	btn.set_meta("album_name", name)
+	if album_card:
+		btn.set_meta("device_bucket", bucket_id)
+		_bind_long_press(btn)
+	else:
+		btn.pressed.connect(_open_device_album.bind(bucket_id, name))
 	card_grid.add_child(btn)
 	if not (cover is Dictionary) or cover.is_empty():
 		return
@@ -496,23 +524,324 @@ func _set_mode_status(offline: bool, message: String = "") -> void:
 
 func _show_album_menu(album_id: int, album_name: String) -> void:
 	# The trunk and built-in buckets are protected: only user sub-albums can be
-	# renamed or deleted from here.
+	# renamed, deleted, or handed to another trunk from here.
 	if album_id <= 0 or album_id == Api.current_trunk_id or album_id == Api.favorite_album_id:
 		return
 	_ctx_album_id = album_id
 	_ctx_album_name = album_name
+	_ctx_device_bucket = ""
 	ctx_menu.clear()
+	ctx_menu.add_item("移动到", MenuId.MOVE_ALBUM)
+	ctx_menu.add_item("复制到", MenuId.COPY_ALBUM)
 	ctx_menu.add_item("改名", MenuId.RENAME)
 	ctx_menu.add_item("删除相册", MenuId.DELETE_ALBUM)
 	ctx_menu.popup(Rect2i(Vector2i(get_global_mouse_position()), Vector2i.ZERO))
 
 
+## Menu for a device album (系统相册). The device owns the album and its files, so
+## the only actions are pushing them into a cloud trunk: 移动到 红泥相册/隐私相册,
+## or 复制到 (which leaves the device's own files in place).
+func _show_device_album_menu(bucket_id: String, album_name: String) -> void:
+	if bucket_id == "" or bucket_id == DeviceMedia.ALL_BUCKET or bucket_id == DeviceMedia.VIDEO_BUCKET:
+		return
+	_ctx_album_id = 0
+	_ctx_album_name = album_name
+	_ctx_device_bucket = bucket_id
+	ctx_menu.clear()
+	ctx_menu.add_item("移动到", MenuId.MOVE_ALBUM)
+	ctx_menu.add_item("复制到", MenuId.COPY_ALBUM)
+	ctx_menu.popup(Rect2i(Vector2i(get_global_mouse_position()), Vector2i.ZERO))
+
+
 func _on_ctx_menu(id: int) -> void:
+	var device_source := _ctx_device_bucket != ""
 	match id:
+		MenuId.MOVE_ALBUM:
+			_prompt_album_target("移动「%s」到" % _ctx_album_name, device_source,
+				_apply_album_transfer.bind(true, _ctx_device_bucket, _ctx_album_id, _ctx_album_name))
+		MenuId.COPY_ALBUM:
+			_prompt_album_target("复制「%s」到" % _ctx_album_name, device_source,
+				_apply_album_transfer.bind(false, _ctx_device_bucket, _ctx_album_id, _ctx_album_name))
 		MenuId.RENAME:
 			await _rename_album(_ctx_album_id, _ctx_album_name)
 		MenuId.DELETE_ALBUM:
-			await _delete_album(_ctx_album_id)
+			await _delete_album(_ctx_album_id, _ctx_album_name)
+
+
+# --- 移动到 / 复制到 (album) --------------------------------------------------
+
+## Album destination picker. The targets are the THREE trunks' roots only — an
+## album is never nested inside another album, while the photos *within* an album
+## choose freely (other trunks' 散件 + this trunk's other sub-albums, see the asset
+## menu). A cloud album's own trunk is left out: moving there would change
+## nothing, and copying there would only duplicate the album beside itself.
+## `on_pick(target)` receives {kind, trunk, label}.
+func _prompt_album_target(title: String, device_source: bool, on_pick: Callable) -> void:
+	var options: Array = []
+	for t in [Api.TRUNK_CLOUD, Api.TRUNK_PRIVATE]:
+		if not device_source and t == current_trunk:
+			continue
+		options.append({
+			"kind": TargetId.CLOUD if t == Api.TRUNK_CLOUD else TargetId.PRIVATE,
+			"trunk": t,
+			"label": _target_label(t, device_source),
+		})
+	if not device_source:
+		options.append({
+			"kind": TargetId.DEVICE,
+			"trunk": "",
+			"label": "系统相册（Pictures/%s）" % ASSET_MENU.EXPORT_DIR_NAME,
+		})
+	if options.is_empty():
+		_set_status_notice("没有可移动到的相册")
+		return
+
+	var labels: Array = []
+	var popup := AcceptDialog.new()
+	popup.title = title
+	var opt := OptionButton.new()
+	for o in options:
+		opt.add_item(str(o["label"]))
+		opt.set_item_metadata(opt.item_count - 1, o)
+		labels.append(str(o["label"]))
+	popup.add_child(opt)
+	add_child(popup)
+	opt.custom_minimum_size.x = ASSET_MENU.picker_width(opt, labels)
+	popup.confirmed.connect(_on_target_picked.bind(opt, popup, on_pick))
+	popup.canceled.connect(popup.queue_free)
+	popup.popup_centered()
+
+
+## How a trunk is offered as a destination: a device album keeps its own
+## grouping in 红泥相册 (one cloud album per device album) but has no counterpart
+## in 隐私相册, where everything lands in 散照.
+func _target_label(trunk: String, device_source: bool) -> String:
+	if trunk == Api.TRUNK_CLOUD:
+		return "红泥相册（按本机相册归位）" if device_source else "红泥相册"
+	return "隐私相册（散照）" if device_source else "隐私相册"
+
+
+func _on_target_picked(opt: OptionButton, popup: AcceptDialog, on_pick: Callable) -> void:
+	var target = opt.get_item_metadata(opt.selected)
+	if is_instance_valid(popup):
+		popup.queue_free()
+	if target is Dictionary and not (target as Dictionary).is_empty():
+		on_pick.call(target)
+
+
+## Runs a picked album destination. A device album's photos are uploaded into the
+## target trunk; a cloud album is re-parented (移动) or duplicated (复制) there, or
+## exported to the device gallery.
+func _apply_album_transfer(target: Dictionary, move: bool, bucket: String, album_id: int, album_name: String) -> void:
+	if bucket != "":
+		await _upload_device_album(bucket, album_name, move, target)
+		return
+	if int(target["kind"]) == TargetId.DEVICE:
+		await _album_to_device(album_id, move)
+	elif move:
+		await _reparent_album(album_id, target)
+	else:
+		await _duplicate_album(album_id, album_name, target)
+
+
+## 移动到 (cloud): the album itself changes hands — the server re-parents it under
+## the target trunk's root, merging it into a same-named album already sitting
+## there (its photos move in, its child albums are re-parented) in one
+## transaction; a client-side sequence of membership calls could not do that
+## safely, and would also mean one request per photo.
+func _reparent_album(album_id: int, target: Dictionary) -> void:
+	var trunk := str(target["trunk"])
+	if trunk == Api.TRUNK_PRIVATE and not await Lock.require_unlock():
+		return
+	var root := await _trunk_root_id(trunk)
+	if root <= 0:
+		_set_status_notice("找不到「%s」顶层相册" % target["label"])
+		return
+	var res: Dictionary = await Api.move_album(album_id, root)
+	if res.has("error"):
+		_set_status_notice("移动失败：" + str(res["error"]))
+		_reload_context.call_deferred()
+		return
+	var data: Dictionary = res.get("data", {})
+	if data.get("merged_into") != null:
+		_set_status_notice("已并入同名相册（并入 %d 项）" % int(data.get("moved", 0)))
+	else:
+		_set_status_notice("已移动到 %s" % target["label"])
+	_reload_context.call_deferred()
+
+
+## 复制到 (cloud): the album is duplicated under the target trunk — same name
+## (merged into an existing same-named album there, exactly like a move), same
+## members. Assets are shared, never re-uploaded: a copy adds album memberships.
+func _duplicate_album(album_id: int, album_name: String, target: Dictionary) -> void:
+	var trunk := str(target["trunk"])
+	if trunk == Api.TRUNK_PRIVATE and not await Lock.require_unlock():
+		return
+	var root := await _trunk_root_id(trunk)
+	if root <= 0:
+		_set_status_notice("找不到「%s」顶层相册" % target["label"])
+		return
+	var members: Dictionary = await _album_assets(album_id)
+	if not bool(members["complete"]):
+		_set_status_notice("无法读取相册内容，已取消")
+		return
+	var host := await _find_or_create_album(root, album_name, trunk == Api.TRUNK_PRIVATE)
+	if host <= 0:
+		_set_status_notice("复制失败：无法建立目标相册")
+		return
+	var assets: Array = members["assets"]
+	var copied := 0
+	for a in assets:
+		var id := int(a.get("id", 0))
+		if id <= 0:
+			continue
+		var r: Dictionary = await Api.add_asset_to_album(host, id)
+		if not r.has("error"):
+			copied += 1
+	var note := "已复制到 %s（%d 项）" % [target["label"], copied]
+	if copied < assets.size():
+		note += "；%d 项失败" % (assets.size() - copied)
+	_set_status_notice(note)
+	_reload_context.call_deferred()
+
+
+## 复制/移动到系统相册: the album's photos are written into Pictures/红泥 (Android's
+## gallery insert is images-only, so videos are counted separately) and, for a
+## move, the cloud copies are soft-deleted into the recycle bin. The emptied
+## album is dropped too — but only when every member really made it across, so a
+## video that had to be skipped keeps its album (and its place in the gallery).
+func _album_to_device(album_id: int, move: bool) -> void:
+	var members: Dictionary = await _album_assets(album_id)
+	if not bool(members["complete"]):
+		_set_status_notice("无法读取相册内容，已取消")
+		return
+	var assets: Array = members["assets"]
+	if assets.is_empty():
+		_set_status_notice("该相册是空的")
+		return
+	var r: Dictionary = await Sync.export_assets_to_device(assets, move)
+	var written := int(r["written"])
+	var note := "已%s到系统相册 %d 项" % ["移动" if move else "复制", written]
+	if int(r["skipped_video"]) > 0:
+		note += "（跳过视频 %d）" % int(r["skipped_video"])
+	if move and written == assets.size():
+		if await _has_child_albums(album_id):
+			note += "；相册保留（含子相册）"
+		else:
+			await Api.delete_album(album_id)
+	_set_status_notice(note)
+	_reload_context.call_deferred()
+
+
+## 系统相册 → cloud: uploads one device album's items into the target trunk, then
+## 移动 removes the device's own files — but only the ones whose cloud copy is
+## really there (Android shows its own confirmation for the delete).
+func _upload_device_album(bucket_id: String, album_name: String, move: bool, target: Dictionary) -> void:
+	var trunk := str(target["trunk"])
+	if trunk == Api.TRUNK_PRIVATE and not await Lock.require_unlock():
+		return
+	var items := DeviceMedia.bucket_items(bucket_id)
+	if items.is_empty():
+		_set_status_notice("「%s」没有可上传的项目" % album_name)
+		return
+	# 红泥相册 keeps the device album's own grouping (a cloud album per device
+	# album); 隐私相册 has no counterpart, so its files land in that trunk's 散照.
+	var album_id := 0
+	if int(target["kind"]) == TargetId.CLOUD:
+		album_id = await Api.resolve_device_album(album_name)
+	else:
+		album_id = await Api.resolve_scatter_album(Api.TRUNK_PRIVATE)
+	if album_id <= 0:
+		_set_status_notice("无法准备目标相册")
+		return
+
+	var done: Array = []
+	var failed := 0
+	progress.value = 0.0
+	progress.max_value = float(items.size())
+	for it in items:
+		var r: Dictionary = await Sync.upload_device_item(it, album_id)
+		if int(r.get("asset_id", 0)) > 0:
+			done.append(it)
+		else:
+			failed += 1
+		progress.value = float(done.size() + failed)
+	progress.max_value = 1.0
+	progress.value = 0.0
+
+	var note := "已上传 %d 项到 %s" % [done.size(), str(target["label"])]
+	if move and not done.is_empty():
+		note += "；已从本机删除 %d 项" % (await DeviceMedia.delete_items(done)).size()
+	if failed > 0:
+		note += "（%d 项失败）" % failed
+	_set_status_notice(note)
+	_reload_context.call_deferred()
+
+
+## Every asset of an album, following the server's cursor paging.
+## {"assets": [...], "complete": bool} — complete is false when a page failed, and
+## the callers then abort instead of acting on a partial album.
+func _album_assets(album_id: int) -> Dictionary:
+	var out: Array = []
+	var cursor := ""
+	while true:
+		var r: Dictionary = await Api.list_assets("all", album_id, cursor)
+		if r.has("error"):
+			return {"assets": out, "complete": false}
+		var data: Dictionary = r["data"]
+		var page = data.get("assets", [])
+		if page is Array:
+			out.append_array(page)
+		cursor = str(data.get("next_cursor", ""))
+		if cursor == "":
+			break
+	return {"assets": out, "complete": true}
+
+
+## Host album for a copy: the same-named child of `root` when one is already
+## there (copying into it merges, as the server's move does), otherwise a new one.
+func _find_or_create_album(root: int, name: String, hidden: bool) -> int:
+	var r: Dictionary = await Api.list_albums()
+	if r.has("error"):
+		return 0
+	for a in r["data"]["albums"]:
+		var pid = a.get("parent_id")
+		if pid != null and int(pid) == root and str(a.get("name", "")) == name:
+			return int(a["id"])
+	var created: Dictionary = await Api.create_album(name, root, hidden, "two_way")
+	if created.has("error"):
+		return 0
+	return int(created["data"]["id"])
+
+
+func _has_child_albums(album_id: int) -> bool:
+	var r: Dictionary = await Api.list_albums()
+	if r.has("error"):
+		return true  # unknown: keep the album rather than risk orphaning children
+	for a in r["data"]["albums"]:
+		var pid = a.get("parent_id")
+		if pid != null and int(pid) == album_id:
+			return true
+	return false
+
+
+func _trunk_root_id(trunk: String) -> int:
+	var r: Dictionary = await Api.list_albums()
+	if r.has("error"):
+		return 0
+	return _top_level_id(r["data"]["albums"], trunk)
+
+
+func _top_level_id(albums: Array, name: String) -> int:
+	for a in albums:
+		if a.get("parent_id") == null and str(a.get("name", "")) == name:
+			return int(a["id"])
+	return 0
+
+
+## One-off status line (the album list keeps its own status otherwise).
+func _set_status_notice(text: String) -> void:
+	status_label.text = text
 
 
 # --- Album actions (rename / delete) -----------------------------------------
@@ -549,10 +878,94 @@ func _do_rename_album(name: String, album_id: int, popup: AcceptDialog, edit: Li
 	_reload_context.call_deferred()
 
 
-func _delete_album(album_id: int) -> void:
+## Album deletion. An empty album (no members, no sub-albums) goes out on the
+## tap; anything still holding something asks first, because the server's
+## `ON DELETE CASCADE` sweeps the whole sub-album sub-tree in one statement and
+## the album row is what its photos hang off. The server trashes whatever it
+## would otherwise orphan (store.DeleteAlbum), so the confirmation is about the
+## album tree going away — the photos land in the recycle bin, not in limbo.
+func _delete_album(album_id: int, album_name: String) -> void:
 	if album_id <= 0:
 		return
-	await Api.delete_album(album_id)
+	var scope: Dictionary = await _album_delete_scope(album_id)
+	if bool(scope["empty"]):
+		await _do_delete_album(album_id)
+		return
+	var popup := ConfirmationDialog.new()
+	popup.title = "删除相册"
+	popup.ok_button_text = "删除"
+	popup.dialog_text = _delete_album_warning(album_name, scope)
+	popup.confirmed.connect(_on_delete_album_confirmed.bind(popup, album_id))
+	popup.canceled.connect(popup.queue_free)
+	add_child(popup)
+	popup.popup_centered()
+
+
+## What deleting `album_id` would take with it: its own members (first page —
+## enough to tell empty from not empty, `more` says the count is a floor) and its
+## direct sub-albums, which the cascade deletes as well. `empty` is true only
+## when both are; an unreadable scope reports non-empty so the confirm still
+## shows rather than risking a blind cascade.
+func _album_delete_scope(album_id: int) -> Dictionary:
+	var members := 0
+	var more := false
+	var children: Array = []
+	var known := true
+	var ra: Dictionary = await Api.list_assets("all", album_id)
+	if ra.has("error"):
+		known = false
+	else:
+		var page = ra["data"].get("assets", [])
+		if page is Array:
+			members = page.size()
+		more = str(ra["data"].get("next_cursor", "")) != ""
+	var rl: Dictionary = await Api.list_albums()
+	if rl.has("error"):
+		known = false
+	else:
+		for a in rl["data"]["albums"]:
+			var pid = a.get("parent_id")
+			if pid != null and int(pid) == album_id:
+				children.append(str(a.get("name", "")))
+	return {
+		"members": members,
+		"more": more,
+		"children": children,
+		"empty": known and members == 0 and children.is_empty(),
+	}
+
+
+## The one line the confirmation shows: what is about to be lost, and what is not.
+## The server trashes the members it would otherwise orphan (with the album's name
+## attached), so the promise here is the recycle bin, not 全部.
+func _delete_album_warning(album_name: String, scope: Dictionary) -> String:
+	var bits: Array = []
+	var members := int(scope["members"])
+	if members > 0:
+		bits.append("超过 %d 张照片" % members if bool(scope["more"]) else "%d 张照片" % members)
+	var children: Array = scope["children"]
+	if not children.is_empty():
+		var shown: Array = children.slice(0, 3)
+		if shown.size() < children.size():
+			shown.append("…")
+		bits.append("%d 个子相册：%s" % [children.size(), "、".join(shown)])
+	var holding := "（%s）" % "、".join(bits) if not bits.is_empty() else ""
+	return "删除相册「%s」%s？\n相册会连同子相册一并删除；里面的照片移入最近删除（30 天内可恢复，恢复时按名字重建相册），与别的相册共享的照片不受影响。" % [album_name, holding]
+
+
+func _on_delete_album_confirmed(popup: ConfirmationDialog, album_id: int) -> void:
+	if is_instance_valid(popup):
+		popup.queue_free()
+	await _do_delete_album(album_id)
+
+
+## Sends the delete and reports the server's answer: nothing is dropped locally,
+## so a rejected request leaves the grid exactly as it was.
+func _do_delete_album(album_id: int) -> void:
+	var r: Dictionary = await Api.delete_album(album_id)
+	if r.has("error"):
+		_set_status_notice("删除相册失败：%s" % str(r["error"]))
+		return
 	_reload_context.call_deferred()
 
 
@@ -596,7 +1009,7 @@ func _do_create_album(name: String, popup: AcceptDialog, edit: LineEdit) -> void
 			return
 		trunk_id = int(trunk["id"])
 	# Unified two-way sync: every album now syncs the same way.
-	var res: Dictionary = await Api.create_album(album_name, trunk_id, current_trunk == TRUNK_PRIVATE, "two_way")
+	var res: Dictionary = await Api.create_album(album_name, trunk_id, current_trunk == Api.TRUNK_PRIVATE, "two_way")
 	if res.has("error"):
 		_reopen_with_error(popup, edit, album_name, "创建失败：", str(res["error"]))
 		return
@@ -642,7 +1055,19 @@ func _start_backup() -> void:
 	progress.value = 0.0
 	if not Sync.progress_changed.is_connected(_on_progress):
 		Sync.progress_changed.connect(_on_progress)
+	# The sync mirrors device deletions into the cloud, so its result — including
+	# how many cloud items it removed — must be visible, not just the label.
+	if not Sync.backup_finished.is_connected(_on_backup_finished):
+		Sync.backup_finished.connect(_on_backup_finished)
 	Sync.run_sync.call_deferred()
+
+
+func _on_backup_finished(_success: bool, message: String) -> void:
+	progress.value = 0.0
+	# A sync that mirrored deletions changes what the device trunk lists.
+	if current_trunk == TRUNK_SYSTEM:
+		_reload_context.call_deferred()
+	status_label.text = message
 
 
 func _on_progress(done: int, total: int) -> void:

@@ -51,10 +51,21 @@ func _build_ui() -> void:
 	v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	root.add_child(v)
 
+	# --- Top bar: 返回 pinned to the top-left, title beside it ---
+	var top := HBoxContainer.new()
+	v.add_child(top)
+
+	var btn_back := Button.new()
+	btn_back.text = "← 返回"
+	btn_back.focus_mode = Control.FOCUS_NONE
+	btn_back.pressed.connect(_go_back)
+	top.add_child(btn_back)
+
 	var title := Label.new()
 	title.text = "红泥 · 设置"
 	title.add_theme_font_size_override("font_size", 28)
-	v.add_child(title)
+	title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	top.add_child(title)
 
 	# --- Server nodes ---
 	var hdr_srv := Label.new()
@@ -145,11 +156,6 @@ func _build_ui() -> void:
 	pin_row.add_child(btn_pin)
 	pin_status = Label.new()
 	v.add_child(pin_status)
-
-	var btn_back := Button.new()
-	btn_back.text = "← 返回"
-	btn_back.pressed.connect(_go_back)
-	v.add_child(btn_back)
 
 	_build_node_editor()
 	if not Lock.lan_result.is_connected(_on_lan_result):

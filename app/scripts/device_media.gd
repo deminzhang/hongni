@@ -24,6 +24,10 @@ extends Node
 
 const ALL_BUCKET := "__all__"
 const ROOT_BUCKET := "__root__"
+# 桌面导出（Pictures/红泥）重名时的编号上限；用满后退回时间戳名字，绝不覆盖。
+const MAX_GALLERY_NAME_TRIES := 1000
+# 同名文件是否「同一张照片」按内容哈希判定，与云端识别文件的方式一致。
+const PROBE := preload("res://scripts/media_probe.gd")
 # Virtual bucket: every video of the device, whatever album it lives in.
 const VIDEO_BUCKET := "__video__"
 const THUMB_DIR := "user://system_thumbs"
@@ -77,6 +81,23 @@ func refresh() -> Array:
 
 func items() -> Array:
 	return _items
+
+
+## A fresh, newest-first device list that leaves the displayed cache and the
+## thumbnail worker alone. The sync engine needs a current, trustworthy read
+## while the grid may still be waiting on decodes that refresh() would cancel.
+func scan_items() -> Array:
+	var items := _collect()
+	items.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return int(a["taken_at"]) > int(b["taken_at"]))
+	return items
+
+
+## Whether a scan covers the whole gallery: on Android 14+ the user can grant a
+## hand-picked subset of photos, and a scan listing only those is no evidence
+## about the ones it leaves out. Desktop reads the folder directly, so it does.
+func scan_is_complete() -> bool:
+	return Lock.has_full_media_access()
 
 
 ## Albums in newest-first order: [{id, name, count, cover}] where `cover` is the
@@ -371,6 +392,105 @@ func _cover_crop(src: Image, size: int) -> Image:
 	var crop := src.get_region(Rect2i(int((w - side) / 2.0), int((h - side) / 2.0), side, side))
 	crop.resize(size, size, Image.INTERPOLATE_BILINEAR)
 	return crop
+
+
+## Whether device media lives in MediaStore (Android) rather than the filesystem.
+func is_android() -> bool:
+	return OS.get_name() == "Android"
+
+
+## Removes device items from the device itself and returns the keys that really
+## went away. The verdict comes from a fresh scan, not from the platform's own
+## report: whatever was removed is simply no longer listed, which also covers a
+## declined confirmation. Only the items passed in are ever touched.
+func delete_items(items: Array) -> Array:
+	var keys: Array = []
+	for it in items:
+		keys.append(key_of(it))
+	if keys.is_empty():
+		return []
+	if not is_android():
+		for it in items:
+			var path := str(it.get("path", ""))
+			if path != "":
+				DirAccess.remove_absolute(path)
+		refresh()
+		return _keys_gone(keys)
+	var seq := Lock.media_delete_seq()
+	if Lock.delete_media(items) < 0:
+		seq = await Lock.await_media_delete(seq)
+	refresh()
+	var gone := _keys_gone(keys)
+	if not gone.is_empty() and gone.size() < keys.size():
+		# Android 10 removes what it can silently and only then asks about the
+		# rest, so a partial answer came in before the dialog. Wait for the
+		# dialog's own report before calling the remainder cancelled.
+		await Lock.await_media_delete(seq, 15.0)
+		refresh()
+		gone = _keys_gone(keys)
+	return gone
+
+
+## Which of `keys` the last scan no longer lists.
+func _keys_gone(keys: Array) -> Array:
+	var live: Dictionary = {}
+	for it in _items:
+		live[key_of(it)] = true
+	var gone: Array = []
+	for k in keys:
+		if not live.has(str(k)):
+			gone.append(k)
+	return gone
+
+
+## Copies a local file into the device gallery. Android can only add media it
+## owns without a prompt, so the copy lands in Pictures/红泥 — the device's own
+## albums are the device's, not ours to write into; the system gallery app then
+## lists it like any other photo. Desktop copies under Pictures/红泥 as well.
+## `src_user_path` is a user:// path. False on failure.
+func export_to_gallery(src_user_path: String, display_name: String, mime_type: String) -> bool:
+	if src_user_path == "" or not FileAccess.file_exists(src_user_path):
+		return false
+	if is_android():
+		return Lock.save_to_gallery(ProjectSettings.globalize_path(src_user_path), display_name, mime_type)
+	var profile := OS.get_environment("USERPROFILE")
+	if profile == "":
+		return false
+	var dir := profile + "/Pictures/红泥"
+	if not DirAccess.dir_exists_absolute(dir) and DirAccess.make_dir_recursive_absolute(dir) != OK:
+		return false
+	var src := ProjectSettings.globalize_path(src_user_path)
+	var target := _gallery_target(dir, display_name, src)
+	if target == "":
+		# 同一张照片已经在 Pictures/红泥 里（内容一致）：不必再写一遍，也算成功。
+		return true
+	return DirAccess.copy_absolute(src, dir + "/" + target) == OK
+
+
+## Where a desktop export lands inside `dir`: `display_name` when it is free, the
+## numbered "x (1).jpg" when a *different* photo already holds that name, and ""
+## when the file already there is this very photo (same bytes — writing it again
+## would only overwrite a copy with itself). Android needs none of this: the
+## gallery insert renames duplicates on its own.
+func _gallery_target(dir: String, display_name: String, src_path: String) -> String:
+	var base := display_name
+	var ext := ""
+	var dot := display_name.rfind(".")
+	if dot > 0:
+		base = display_name.substr(0, dot)
+		ext = display_name.substr(dot)
+	var src_hash := PROBE.sha256_file(src_path)
+	for n in MAX_GALLERY_NAME_TRIES:
+		var candidate := display_name if n == 0 else "%s (%d)%s" % [base, n, ext]
+		var target := dir + "/" + candidate
+		if not FileAccess.file_exists(target):
+			return candidate
+		# 同名且同一张照片：合并不重写。同名但不是同一张：给后进的换个号。
+		if src_hash != "" and PROBE.sha256_file(target) == src_hash:
+			return ""
+	# 同名文件多到撞满整个编号空间（现实中不会发生）：退回带时间戳的名字，
+	# 无论如何都不覆盖别人的照片。
+	return "%s (%d)%s" % [base, int(Time.get_unix_time_from_system()), ext]
 
 
 # --- Full-screen previews ----------------------------------------------------

@@ -2,6 +2,7 @@ package com.hongni.plugin
 
 import android.Manifest
 import android.app.Activity
+import android.app.RecoverableSecurityException
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -68,6 +69,9 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     companion object {
         private const val REQ_PHOTO_PICKER = 4242
         private const val REQ_PERMISSIONS = 4243
+        // Android 11+ delete confirmation (MediaStore.createDeleteRequest) and
+        // the API 29 RecoverableSecurityException dialog both report here.
+        private const val REQ_MEDIA_DELETE = 4244
         private const val PREFS_NAME = "hongni_backup"
         private const val KEY_PENDING = "backup_pending"
     }
@@ -77,11 +81,17 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     override fun getPluginSignals(): Set<SignalInfo> = setOf(
         SignalInfo("biometric_result", String::class.java),
         SignalInfo("photo_picker_result", String::class.java),
+        SignalInfo("media_delete_result", String::class.java),
         SignalInfo("lan_scan_result", String::class.java),
         SignalInfo("backup_pending"),
         SignalInfo("inapp_video_closed"),
         SignalInfo("inapp_video_prepared"),
     )
+
+    // MediaStore _ID strings of the items whose deletion is waiting on a system
+    // confirmation dialog. onMainActivityResult reports them only when the user
+    // actually approved, which is what keeps the signal honest.
+    @Volatile private var pendingDeleteIds: List<String> = emptyList()
 
     // In-app video playback (MediaPlayer + TextureView frame bridge). The
     // TextureView is a tiny 1x1 view attached to the activity so the decode
@@ -439,6 +449,113 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
         }
     }
 
+    /**
+     * Deletes MediaStore items from the device gallery. itemsJson is a JSON
+     * array of {"uri": "content://…", "id": "<_ID>"}.
+     *
+     * Returns how many items were deleted synchronously, or -1 when the system
+     * asked the user to confirm (the outcome then arrives as media_delete_result).
+     * Below API 29 the delete is silent and the count is final.
+     */
+    @UsedByGodot
+    fun delete_media(itemsJson: String): Int {
+        val activity = getActivity() ?: return 0
+        val uris = mutableListOf<Uri>()
+        val ids = mutableListOf<String>()
+        try {
+            val arr = JSONArray(itemsJson)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val uriStr = o.optString("uri", "")
+                if (uriStr.isEmpty()) continue
+                uris.add(Uri.parse(uriStr))
+                ids.add(o.optString("id", ""))
+            }
+        } catch (e: Exception) {
+            // Malformed payload: nothing to delete.
+            return 0
+        }
+        if (uris.isEmpty()) return 0
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                // Android 11+ owns the confirmation UI; the delete only happens
+                // after the user approves, so the ids must wait for the result.
+                pendingDeleteIds = ids
+                val pi = MediaStore.createDeleteRequest(activity.contentResolver, uris)
+                runOnUiThread {
+                    try {
+                        activity.startIntentSenderForResult(
+                            pi.intentSender, REQ_MEDIA_DELETE, null, 0, 0, 0,
+                        )
+                    } catch (e: Exception) {
+                        pendingDeleteIds = emptyList()
+                        emitSignal("media_delete_result", "[]")
+                    }
+                }
+                -1
+            } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
+                deleteMediaQ(activity, uris, ids)
+            } else {
+                ensureWritePermission(activity)
+                var deleted = 0
+                for (i in uris.indices) {
+                    try {
+                        if (activity.contentResolver.delete(uris[i], null, null) > 0) deleted++
+                    } catch (e: Exception) {
+                        // Not removable without user consent — leave it alone.
+                    }
+                }
+                deleted
+            }
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    /**
+     * API 29: silent delete works until MediaStore raises a
+     * RecoverableSecurityException. Only one confirmation dialog can be pending
+     * at a time, so the first such item stops the batch and its dialog result
+     * arrives later; ids deleted before that point are reported right away.
+     */
+    private fun deleteMediaQ(activity: Activity, uris: List<Uri>, ids: List<String>): Int {
+        val done = JSONArray()
+        for (i in uris.indices) {
+            try {
+                if (activity.contentResolver.delete(uris[i], null, null) > 0) {
+                    done.put(ids[i])
+                }
+            } catch (e: Exception) {
+                // RecoverableSecurityException only exists on API 29+; the SDK
+                // check keeps the class off the verifier's path on older devices.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                    e is RecoverableSecurityException
+                ) {
+                    val sender = e.userAction?.actionIntent?.intentSender
+                    if (sender != null) {
+                        pendingDeleteIds = listOf(ids[i])
+                        if (done.length() > 0) {
+                            emitSignal("media_delete_result", done.toString())
+                        }
+                        runOnUiThread {
+                            try {
+                                activity.startIntentSenderForResult(
+                                    sender, REQ_MEDIA_DELETE, null, 0, 0, 0,
+                                )
+                            } catch (e2: Exception) {
+                                pendingDeleteIds = emptyList()
+                                emitSignal("media_delete_result", "[]")
+                            }
+                        }
+                        return -1
+                    }
+                }
+                // No confirmation path for this item — skip it, never count it.
+            }
+        }
+        return done.length()
+    }
+
     @UsedByGodot
     fun save_to_gallery(srcAbsPath: String, displayName: String, mimeType: String): Boolean {
         val activity = getActivity() ?: return false
@@ -499,6 +616,14 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     }
 
     override fun onMainActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQ_MEDIA_DELETE) {
+            // Ids are reported only when the user approved; a refusal must look
+            // exactly like "nothing was deleted".
+            val ids = if (resultCode == Activity.RESULT_OK) pendingDeleteIds else emptyList()
+            pendingDeleteIds = emptyList()
+            emitSignal("media_delete_result", JSONArray(ids).toString())
+            return
+        }
         if (requestCode != REQ_PHOTO_PICKER) return
         if (resultCode != Activity.RESULT_OK || data == null) {
             emitSignal("photo_picker_result", "[]")
@@ -1041,6 +1166,31 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
 
     // --- helpers ---
 
+    /**
+     * Whether the app can see the whole device gallery, as opposed to Android
+     * 14's "selected photos only" grant. Only a full grant makes a scan a
+     * statement about what the device still holds: the backup mirrors device
+     * deletions into the cloud, and must never read a hand-picked subset as
+     * "everything else was deleted".
+     */
+    @UsedByGodot
+    fun has_full_media_access(): Boolean {
+        val activity = getActivity() ?: return false
+        return hasFullMediaAccess(activity)
+    }
+
+    private fun hasFullMediaAccess(activity: Activity): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return activity.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) ==
+                PackageManager.PERMISSION_GRANTED &&
+                activity.checkSelfPermission(Manifest.permission.READ_MEDIA_VIDEO) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+        // minSdk 24: below TIRAMISU the media grant is READ_EXTERNAL_STORAGE.
+        return activity.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
     private fun ensureMediaPermission(activity: Activity): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             // Full media access OR Android 14+ partial ("selected photos") access
@@ -1049,13 +1199,10 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                 Manifest.permission.READ_MEDIA_IMAGES,
                 Manifest.permission.READ_MEDIA_VIDEO,
             )
-            val hasFull = full.all {
-                activity.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
-            }
             val hasPartial = activity.checkSelfPermission(
                 Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
             ) == PackageManager.PERMISSION_GRANTED
-            if (hasFull || hasPartial) return true
+            if (hasFullMediaAccess(activity) || hasPartial) return true
             runOnUiThread {
                 activity.requestPermissions(full, REQ_PERMISSIONS)
             }
