@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.SurfaceTexture
 import android.hardware.biometrics.BiometricManager
 import android.hardware.biometrics.BiometricPrompt
@@ -49,12 +51,14 @@ import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * Godot Android plugin (v2) singleton "HongniPlugin". Exposes biometric
  * authentication, PBKDF2 PIN hashing, MediaStore scanning, the photo picker,
  * saving files into the device gallery (Pictures/Hongni), WorkManager-driven
- * periodic backup, video playback, and mDNS LAN discovery.
+ * periodic backup, video playback (prepared paused — GDScript drives play/seek
+ * and builds the preview-frame filmstrip), and mDNS LAN discovery.
  *
  * GDScript calls methods by exact snake_case name; there is no camelCase
  * coercion, so every @UsedByGodot method below is named to match GDScript.
@@ -76,6 +80,7 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
         SignalInfo("lan_scan_result", String::class.java),
         SignalInfo("backup_pending"),
         SignalInfo("inapp_video_closed"),
+        SignalInfo("inapp_video_prepared"),
     )
 
     // In-app video playback (MediaPlayer + TextureView frame bridge). The
@@ -98,7 +103,17 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     // GDScript to detect a stalled decode (frozen picture) and hand off to the
     // OS player; 0 means no update has arrived yet.
     @Volatile private var inAppLastUpdateMs = 0L
-    private var prepared = false
+    // Set by onPrepared; playback only starts when GDScript asks (no autoplay).
+    @Volatile private var prepared = false
+    // Set by onCompletion so GDScript can tell "ended" from "errored" (the
+    // latter emits inapp_video_closed).
+    @Volatile private var inAppCompleted = false
+    // Preview-frame filmstrip (the seek bar): one RGBA image of `count` tiled
+    // frames, built on a worker thread and collected by take_video_filmstrip().
+    private val filmstripLock = Any()
+    private var filmstripBytes: ByteArray? = null
+    private var filmstripToken = 0
+    private var filmstripRequestToken = 0
     // Background video-thumbnail extraction results, drained by GDScript.
     private val videoThumbQueue = ConcurrentLinkedQueue<Int>()
     private val videoThumbExecutor = Executors.newFixedThreadPool(2)
@@ -180,13 +195,9 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
             return "[]"
         }
         val items = JSONArray()
-        val projection = arrayOf(
-            MediaStore.MediaColumns._ID,
-            MediaStore.MediaColumns.DISPLAY_NAME,
-            MediaStore.MediaColumns.MIME_TYPE,
-            MediaStore.MediaColumns.DATE_TAKEN,
-            MediaStore.MediaColumns.SIZE,
-        )
+        // BUCKET_ID/BUCKET_DISPLAY_NAME group the device media into the system
+        // gallery's own albums; WIDTH/HEIGHT (and DURATION for videos) let the
+        // 详细 sheet show dimensions without decoding the file.
         val uris = when (media) {
             "video" -> listOf(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
             "image" -> listOf(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
@@ -199,6 +210,20 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
         val sort = "${MediaStore.MediaColumns.DATE_TAKEN} DESC"
         try {
             for (uri in uris) {
+                val isVideo = uri == MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                val columns = mutableListOf(
+                    MediaStore.MediaColumns._ID,
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                    MediaStore.MediaColumns.MIME_TYPE,
+                    MediaStore.MediaColumns.DATE_TAKEN,
+                    MediaStore.MediaColumns.SIZE,
+                    MediaStore.MediaColumns.WIDTH,
+                    MediaStore.MediaColumns.HEIGHT,
+                    MediaStore.MediaColumns.BUCKET_ID,
+                    MediaStore.MediaColumns.BUCKET_DISPLAY_NAME,
+                )
+                if (isVideo) columns.add(MediaStore.MediaColumns.DURATION)
+                val projection = columns.toTypedArray()
                 val selection = if (afterId > 0) "${MediaStore.MediaColumns._ID} > ?" else null
                 val selArgs = if (afterId > 0) arrayOf(afterId.toString()) else null
                 activity.contentResolver.query(uri, projection, selection, selArgs, sort)?.use { c ->
@@ -207,6 +232,11 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                     val mimeIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
                     val takenIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_TAKEN)
                     val sizeIdx = c.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                    val widthIdx = c.getColumnIndex(MediaStore.MediaColumns.WIDTH)
+                    val heightIdx = c.getColumnIndex(MediaStore.MediaColumns.HEIGHT)
+                    val durationIdx = c.getColumnIndex(MediaStore.MediaColumns.DURATION)
+                    val bucketIdIdx = c.getColumnIndex(MediaStore.MediaColumns.BUCKET_ID)
+                    val bucketNameIdx = c.getColumnIndex(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME)
                     while (c.moveToNext() && items.length() < 1000) {
                         val id = c.getLong(idIdx)
                         val contentUri = uri.buildUpon().appendPath(id.toString()).build().toString()
@@ -217,6 +247,11 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                         o.put("mime_type", c.getString(mimeIdx) ?: "")
                         o.put("taken_at", c.getLong(takenIdx) / 1000L)
                         o.put("size", c.getLong(sizeIdx))
+                        o.put("width", if (widthIdx >= 0) c.getInt(widthIdx) else 0)
+                        o.put("height", if (heightIdx >= 0) c.getInt(heightIdx) else 0)
+                        o.put("duration_ms", if (durationIdx >= 0) c.getLong(durationIdx) else 0L)
+                        o.put("bucket_id", if (bucketIdIdx >= 0) c.getLong(bucketIdIdx) else 0L)
+                        o.put("bucket_name", if (bucketNameIdx >= 0) c.getString(bucketNameIdx) ?: "" else "")
                         items.put(o)
                     }
                 }
@@ -274,6 +309,60 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
         } catch (e: Exception) {
             false
         }
+    }
+
+    /**
+     * Decodes a MediaStore image at up to maxPx on its longest edge, preserving
+     * the aspect ratio, and writes it as JPEG. Unlike load_thumbnail this never
+     * crops, so it can back the full-screen viewer for device photos.
+     */
+    @UsedByGodot
+    fun load_media_preview(uriStr: String, destAbsPath: String, maxPx: Int): Boolean {
+        val activity = getActivity() ?: return false
+        return try {
+            val uri = Uri.parse(uriStr)
+            val limit = if (maxPx <= 0) 2048 else maxPx
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            activity.contentResolver.openInputStream(uri)?.use { s ->
+                BitmapFactory.decodeStream(s, null, bounds)
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false
+            var sample = 1
+            while (max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= limit) {
+                sample *= 2
+            }
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val decoded = activity.contentResolver.openInputStream(uri)?.use { s ->
+                BitmapFactory.decodeStream(s, null, opts)
+            } ?: return false
+            val scaled = fitInside(decoded, limit)
+            try {
+                FileOutputStream(File(destAbsPath)).use { out ->
+                    scaled.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                }
+                true
+            } catch (e: Exception) {
+                false
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Scales a bitmap down so its longest edge is at most maxPx (aspect kept). */
+    private fun fitInside(src: Bitmap, maxPx: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w <= 0 || h <= 0) return src
+        val longest = max(w, h)
+        if (longest <= maxPx) return src
+        val scale = maxPx.toFloat() / longest
+        return Bitmap.createScaledBitmap(
+            src,
+            max(1, (w * scale).roundToInt()),
+            max(1, (h * scale).roundToInt()),
+            true,
+        )
     }
 
     /** Decodes an image item, downsampled, into a center-cropped square thumbnail. */
@@ -483,8 +572,10 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
      * Starts decoding a local video file. A 1x1 on-screen TextureView at the
      * top-left corner keeps the decode surface live (composited, so its
      * SurfaceTexture drains and the decoder never stalls) while Godot renders
-     * the video frames via grab_inapp_frame(). Auto-plays when prepared.
-     * Returns true when the view was scheduled (playback starts asynchronously).
+     * the video frames via grab_inapp_frame(). The player is left **paused**
+     * on its first frame; GDScript starts it with resume_inapp_video() after
+     * the inapp_video_prepared signal. Returns true when the view was
+     * scheduled (preparation is asynchronous).
      */
     @UsedByGodot
     fun start_inapp_video(path: String, frameWidth: Int, frameHeight: Int): Boolean {
@@ -498,6 +589,7 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                 inAppFrameH = h
                 inAppLastUpdateMs = 0L
                 prepared = false
+                inAppCompleted = false
                 val tv = TextureView(activity)
                 tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                     override fun onSurfaceTextureAvailable(st: SurfaceTexture, w0: Int, h0: Int) {
@@ -511,11 +603,13 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                             )
                             mp.setDataSource(path)
                             mp.setSurface(Surface(st))
-                            mp.setOnPreparedListener { p ->
+                            mp.setOnPreparedListener {
                                 prepared = true
-                                p.start()
+                                emitSignal("inapp_video_prepared")
                             }
-                            mp.setOnCompletionListener { emitSignal("inapp_video_closed") }
+                            mp.setOnCompletionListener {
+                                inAppCompleted = true
+                            }
                             mp.setOnErrorListener { _, what, extra ->
                                 Log.e("HongniPlugin", "in-app video error: what=$what extra=$extra path=$path")
                                 emitSignal("inapp_video_closed")
@@ -598,6 +692,58 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
         }
     }
 
+    /** True once prepareAsync() finished (the player sits paused on frame 1). */
+    @UsedByGodot
+    fun inapp_video_prepared(): Boolean = prepared
+
+    /** True once the clip played to its end; cleared by seek_inapp_video(). */
+    @UsedByGodot
+    fun inapp_video_completed(): Boolean = inAppCompleted
+
+    /** Current playback position in ms, 0 when nothing is prepared. */
+    @UsedByGodot
+    fun inapp_video_position_ms(): Long {
+        return try {
+            inAppPlayer?.currentPosition?.toLong() ?: 0L
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    /** Clip duration in ms, -1 when unknown/nothing prepared. */
+    @UsedByGodot
+    fun inapp_video_duration_ms(): Long {
+        return try {
+            val d = inAppPlayer?.duration ?: return -1L
+            if (d > 0) d.toLong() else -1L
+        } catch (e: Exception) {
+            -1L
+        }
+    }
+
+    /**
+     * Seeks to `ms` (clamped to the clip). SEEK_CLOSEST decodes to the exact
+     * requested frame — the viewer commits a seek on drag release, not per
+     * motion event, so the extra decode cost stays off the drag path.
+     */
+    @UsedByGodot
+    fun seek_inapp_video(ms: Long): Boolean {
+        val mp = inAppPlayer ?: return false
+        return try {
+            val duration = mp.duration
+            val target = if (duration > 0) ms.coerceIn(0L, duration.toLong()) else ms.coerceAtLeast(0L)
+            inAppCompleted = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                mp.seekTo(target, MediaPlayer.SEEK_CLOSEST)
+            } else {
+                mp.seekTo(target.toInt())
+            }
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     @UsedByGodot
     fun stop_inapp_video(): Boolean {
         runOnUiThread {
@@ -624,8 +770,95 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
             }
             inAppLastUpdateMs = 0L
             prepared = false
+            inAppCompleted = false
         }
         return true
+    }
+
+    /**
+     * Builds the preview-frame seek bar for a local video: `count` frames evenly
+     * spaced over the clip, centre-cropped to frameW x frameH and tiled left to
+     * right into one RGBA image (width = count * frameW). Runs on a worker
+     * thread — the result is published for take_video_filmstrip(token), which
+     * only accepts the newest request (a stale build finishing late is dropped).
+     */
+    @UsedByGodot
+    fun request_video_filmstrip(path: String, count: Int, frameW: Int, frameH: Int, token: Int): Boolean {
+        val cells = count.coerceIn(1, 32)
+        val w = frameW.coerceIn(16, 480)
+        val h = frameH.coerceIn(9, 270)
+        synchronized(filmstripLock) {
+            filmstripBytes = null
+            filmstripToken = 0
+            filmstripRequestToken = token
+        }
+        videoThumbExecutor.execute {
+            val bytes = buildFilmstrip(path, cells, w, h)
+            synchronized(filmstripLock) {
+                if (filmstripRequestToken == token) {
+                    filmstripBytes = bytes
+                    filmstripToken = token
+                }
+            }
+        }
+        return true
+    }
+
+    /** The filmstrip RGBA bytes for `token`, or empty (consumes the result). */
+    @UsedByGodot
+    fun take_video_filmstrip(token: Int): ByteArray {
+        synchronized(filmstripLock) {
+            if (filmstripToken != token) return ByteArray(0)
+            val bytes = filmstripBytes ?: return ByteArray(0)
+            filmstripBytes = null
+            filmstripToken = 0
+            return bytes
+        }
+    }
+
+    private fun buildFilmstrip(path: String, count: Int, frameW: Int, frameH: Int): ByteArray {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(path)
+        } catch (e: Exception) {
+            retriever.release()
+            return ByteArray(0)
+        }
+        return try {
+            val durationMs = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            val strip = Bitmap.createBitmap(count * frameW, frameH, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(strip)
+            val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+            for (i in 0 until count) {
+                // Frame i covers its own slice of the timeline (i/count).
+                val atMs = if (durationMs > 0) durationMs * i / count else 0L
+                val frame = retriever.getFrameAtTime(
+                    atMs * 1000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                )
+                if (frame != null) {
+                    canvas.drawBitmap(centerCrop(frame, frameW, frameH), (i * frameW).toFloat(), 0f, paint)
+                }
+            }
+            bitmapToRgba(strip)
+        } catch (e: Exception) {
+            ByteArray(0)
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** Scales `src` so it covers frameW x frameH, then takes the centre. */
+    private fun centerCrop(src: Bitmap, w: Int, h: Int): Bitmap {
+        if (src.width <= 0 || src.height <= 0) return src
+        val scale = max(w.toFloat() / src.width, h.toFloat() / src.height)
+        val sw = max(w, (src.width * scale).roundToInt())
+        val sh = max(h, (src.height * scale).roundToInt())
+        val scaled = if (sw == src.width && sh == src.height) src
+        else Bitmap.createScaledBitmap(src, sw, sh, true)
+        return Bitmap.createBitmap(scaled, (sw - w) / 2, (sh - h) / 2, w, h)
     }
 
     /** Returns the latest decoded frame as packed RGBA bytes, or empty. */
@@ -642,20 +875,25 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
             if (bmp.width != tw || bmp.height != th) {
                 bmp = Bitmap.createScaledBitmap(bmp, tw, th, true)
             }
-            val w = tw
-            val h = th
-            val pixels = IntArray(w * h)
-            bmp.getPixels(pixels, 0, w, 0, 0, w, h)
-            val out = ByteArray(w * h * 4)
-            var i = 0
-            for (argb in pixels) {
-                out[i++] = ((argb shr 16) and 0xff).toByte()
-                out[i++] = ((argb shr 8) and 0xff).toByte()
-                out[i++] = (argb and 0xff).toByte()
-                out[i++] = ((argb shr 24) and 0xff).toByte()
-            }
-            return out
+            return bitmapToRgba(bmp)
         }
+    }
+
+    /** Packed RGBA8 bytes (row-major) of a bitmap, as GDScript Image expects. */
+    private fun bitmapToRgba(bmp: Bitmap): ByteArray {
+        val w = bmp.width
+        val h = bmp.height
+        val pixels = IntArray(w * h)
+        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+        val out = ByteArray(w * h * 4)
+        var i = 0
+        for (argb in pixels) {
+            out[i++] = ((argb shr 16) and 0xff).toByte()
+            out[i++] = ((argb shr 8) and 0xff).toByte()
+            out[i++] = (argb and 0xff).toByte()
+            out[i++] = ((argb shr 24) and 0xff).toByte()
+        }
+        return out
     }
 
     /**

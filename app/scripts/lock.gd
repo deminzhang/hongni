@@ -7,6 +7,7 @@ extends Node
 signal lan_result(addresses: Array)
 signal photo_picker_result(uris: Array)
 signal inapp_video_closed
+signal inapp_video_prepared
 signal _pin_prompt_submitted(text: String)
 
 
@@ -28,6 +29,8 @@ func _ready() -> void:
 			p.photo_picker_result.connect(_on_photo_picker_result)
 		if p.has_signal("inapp_video_closed"):
 			p.inapp_video_closed.connect(func() -> void: inapp_video_closed.emit())
+		if p.has_signal("inapp_video_prepared"):
+			p.inapp_video_prepared.connect(func() -> void: inapp_video_prepared.emit())
 
 
 func _has_plugin() -> bool:
@@ -103,20 +106,32 @@ func require_unlock() -> bool:
 	return await _prompt_pin()
 
 
-func _prompt_pin() -> bool:
+## Asks for the current PIN and verifies it *always* — even in a session that is
+## already unlocked — because proving knowledge of the old PIN is the whole point
+## (换 PIN). True when no PIN is set (nothing to prove).
+func require_current_pin() -> bool:
+	if not has_pin_set():
+		return true
+	return await _prompt_pin("输入当前 PIN")
+
+
+func _prompt_pin(prompt: String = "输入 PIN 解锁") -> bool:
 	var scene := get_tree().current_scene
 	if scene == null:
 		return false
 	var dialog := AcceptDialog.new()
 	dialog.title = "家长 PIN"
-	dialog.dialog_text = "输入 PIN 解锁"
+	dialog.dialog_text = prompt
 	var edit := LineEdit.new()
 	edit.secret = true
 	edit.max_length = 6
 	dialog.add_child(edit)
 	scene.add_child(dialog)
+	# Closing the dialog (X) must resolve the await too, or the caller hangs
+	# forever: an empty PIN never verifies, so it lands on the refusal path.
 	edit.text_submitted.connect(func(t: String) -> void: _pin_prompt_submitted.emit(t))
 	dialog.confirmed.connect(func() -> void: _pin_prompt_submitted.emit(edit.text))
+	dialog.canceled.connect(func() -> void: _pin_prompt_submitted.emit(""))
 	dialog.popup_centered()
 	var text: String = await _pin_prompt_submitted
 	if is_instance_valid(dialog):
@@ -164,6 +179,14 @@ func load_thumbnail(uri: String, dest_abs_path: String, size_px: int) -> bool:
 	return _plugin().load_thumbnail(uri, dest_abs_path, size_px)
 
 
+## Decodes a MediaStore image at up to max_px on its longest edge (aspect kept,
+## no crop) into dest_abs_path as JPEG, for the in-app viewer. Android only.
+func load_media_preview(uri: String, dest_abs_path: String, max_px: int) -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().load_media_preview(uri, dest_abs_path, max_px)
+
+
 ## Writes an image file (absolute path) into the device system album
 ## (Pictures/Hongni). Android-only; false on desktop/editor.
 func save_to_gallery(src_abs_path: String, display_name: String, mime_type: String) -> bool:
@@ -183,11 +206,63 @@ func play_video(path_or_uri: String) -> void:
 # --- In-app video playback (Android plugin MediaPlayer -> Godot frames) ------
 
 ## Starts decoding a local path into the app; GDScript polls grab_inapp_frame()
-## and renders it in an in-app TextureRect. Android-only; false on desktop.
+## and renders it in an in-app TextureRect. The player is prepared **paused**;
+## start it with resume_inapp_video() once inapp_video_prepared fires.
+## Android-only; false on desktop.
 func start_inapp_video(path: String, frame_w: int, frame_h: int) -> bool:
 	if not _has_plugin():
 		return false
 	return _plugin().start_inapp_video(path, frame_w, frame_h)
+
+
+## True once the player finished preparing (paused on its first frame).
+func is_inapp_video_prepared() -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().inapp_video_prepared()
+
+
+## True once the clip played to its end (cleared by seek_inapp_video).
+func inapp_video_completed() -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().inapp_video_completed()
+
+
+## Current position in ms; 0 when nothing is prepared.
+func inapp_video_position_ms() -> int:
+	if not _has_plugin():
+		return 0
+	return int(_plugin().inapp_video_position_ms())
+
+
+## Clip duration in ms; -1 when unknown.
+func inapp_video_duration_ms() -> int:
+	if not _has_plugin():
+		return -1
+	return int(_plugin().inapp_video_duration_ms())
+
+
+func seek_inapp_video(ms: int) -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().seek_inapp_video(ms)
+
+
+## Asks the plugin to build the preview-frame seek bar (count frames tiled into
+## one RGBA image) off the main thread. Collect it with take_video_filmstrip().
+func request_video_filmstrip(path: String, count: int, cell_w: int, cell_h: int, token: int) -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().request_video_filmstrip(path, count, cell_w, cell_h, token)
+
+
+## The filmstrip RGBA bytes for `token` (empty while it is still building, when
+## it failed, or when a newer request replaced it).
+func take_video_filmstrip(token: int) -> PackedByteArray:
+	if not _has_plugin():
+		return PackedByteArray()
+	return _plugin().take_video_filmstrip(token)
 
 
 func pause_inapp_video() -> bool:

@@ -27,6 +27,7 @@ Api="*res://scripts/api.gd"
 Sync="*res://scripts/sync.gd"
 Lock="*res://scripts/lock.gd"
 Cache="*res://scripts/cache.gd"
+DeviceMedia="*res://scripts/device_media.gd"
 
 [display]
 

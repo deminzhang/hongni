@@ -97,8 +97,11 @@ func snapshot_albums(albums: Array) -> void:
 	_queue_save()
 
 
-func snapshot_album_assets(album_id: int, assets: Array) -> void:
-	members_cache[str(album_id)] = _strip_assets(assets)
+## Writes one album's member snapshot. `filter` distinguishes the virtual views
+## that reuse an album id (the 视频 card is the trunk with filter=videos), so a
+## filtered view never overwrites the plain album snapshot.
+func snapshot_album_assets(album_id: int, assets: Array, filter: String = "all") -> void:
+	members_cache[_member_key(album_id, filter)] = _strip_assets(assets)
 	_queue_save()
 
 
@@ -106,9 +109,15 @@ func offline_albums() -> Array:
 	return albums_cache
 
 
-func offline_assets(album_id: int) -> Array:
-	var list: Array = members_cache.get(str(album_id), [])
+func offline_assets(album_id: int, filter: String = "all") -> Array:
+	var list: Array = members_cache.get(_member_key(album_id, filter), [])
 	return list
+
+
+## Plain albums keep the historical bare-id key, so catalog.json written by an
+## older build still reads back.
+static func _member_key(album_id: int, filter: String) -> String:
+	return str(album_id) if filter == "all" else "%d:%s" % [album_id, filter]
 
 
 # --- last-viewed tracking (LRU input) ---------------------------------------

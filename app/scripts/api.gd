@@ -12,6 +12,10 @@ const TIMEOUT_FILE := 15.0
 # Transient UI state shared across scenes (navigation context).
 var current_album_id: int = 0
 var current_album_name: String = ""
+# Device-gallery album (系统相册 trunk) being viewed; "" outside that trunk.
+var current_device_bucket: String = ""
+# Server media filter for the grid being opened: "all" normally, "videos" for the
+# 视频 virtual album (the trunk aggregation restricted to videos).
 var current_filter: String = "all"
 var viewer_assets: Array = []
 var viewer_index: int = 0
@@ -22,33 +26,61 @@ var current_trunk: String = "相册"
 var current_trunk_id: int = 0
 var favorite_album_id: int = 0
 var scatter_album_id: int = 0
+# The 散照 bucket of the 相册 (cloud) trunk: where device-gallery uploads land,
+# regardless of which trunk is on screen (the private trunk has its own 散照).
+var import_album_id: int = 0
 
 
-func _base_url() -> String:
-	return Store.server_url() + "/api/v1"
+const API_PATH := "/api/v1"
 
 
-func _headers() -> PackedStringArray:
-	return PackedStringArray(["Authorization: Bearer " + Store.token()])
-
-
+## Sends a request to the server, walking the node list on transport failure:
+## the node that answered last is tried first, then the rest in priority order.
+## The first node that answers (even with an HTTP error status) becomes active.
 func _do_request(method: int, path: String, body: String = "", extra_headers: PackedStringArray = PackedStringArray(), body_raw: PackedByteArray = PackedByteArray(), timeout: float = TIMEOUT_META) -> Dictionary:
+	var nodes := Store.servers()
+	if nodes.is_empty():
+		return {"error": "未配置服务器", "status": 0}
+	var failure: Dictionary = {"error": "所有服务器结点均不可达", "status": 0}
+	for idx in _node_order(nodes.size()):
+		var r: Dictionary = await _request_node(nodes[idx], method, path, body, extra_headers, body_raw, timeout)
+		if not r.get("transport", false):
+			Store.set_active_server(idx)
+			return r
+		failure = r
+	return failure
+
+
+## Active node first, then every other node in priority order.
+func _node_order(count: int) -> Array:
+	var active := clampi(Store.active_server, 0, count - 1)
+	var order: Array = [active]
+	for i in count:
+		if i != active:
+			order.append(i)
+	return order
+
+
+## One request against one node; `transport: true` in the result marks a node
+## that never answered (bad address, DNS, timeout) — the caller tries the next.
+func _request_node(node: Dictionary, method: int, path: String, body: String, extra_headers: PackedStringArray, body_raw: PackedByteArray, timeout: float) -> Dictionary:
 	var http := HTTPRequest.new()
 	http.timeout = timeout
 	add_child(http)
-	var headers := _headers()
+	var headers := PackedStringArray(["Authorization: Bearer " + str(node.get("token", ""))])
 	for h in extra_headers:
 		headers.append(h)
 
+	var url := str(node.get("url", "")) + API_PATH + path
 	var err: int
 	if body_raw.size() > 0:
-		err = http.request_raw(_base_url() + path, headers, method, body_raw)
+		err = http.request_raw(url, headers, method, body_raw)
 	else:
-		err = http.request(_base_url() + path, headers, method, body)
+		err = http.request(url, headers, method, body)
 
 	if err != OK:
 		http.queue_free()
-		return {"error": "request_error_%d" % err}
+		return {"error": "服务器地址无效（%d）" % err, "status": 0, "transport": true}
 
 	var result: Array = await http.request_completed
 	http.queue_free()
@@ -59,7 +91,7 @@ func _do_request(method: int, path: String, body: String = "", extra_headers: Pa
 	var resp_headers: PackedStringArray = result[2]
 
 	if http_result != HTTPRequest.RESULT_SUCCESS:
-		return {"error": "连接失败（网络错误 %d）" % http_result, "status": 0}
+		return {"error": "连接失败（网络错误 %d）" % http_result, "status": 0, "transport": true}
 	var is_json := false
 	for h in resp_headers:
 		if h.begins_with("Content-Type:") and "application/json" in h:
@@ -79,6 +111,44 @@ func _do_request(method: int, path: String, body: String = "", extra_headers: Pa
 		return {"error": msg, "status": response_code}
 
 	return {"status": response_code, "data": parsed, "body": resp_body}
+
+
+## Probes every configured node in parallel; returns one bool per node, in list
+## order. Results are collected by per-request callbacks, never by awaiting each
+## `request_completed` in turn: `request_completed` fires once, so a fast node
+## that finishes while a slow one is still being awaited would never be seen.
+func probe_all() -> Array:
+	var nodes := Store.servers()
+	var results: Array = []
+	results.resize(nodes.size())
+	var pending: Array = [0]
+	for i in nodes.size():
+		var http := HTTPRequest.new()
+		http.timeout = TIMEOUT_META
+		add_child(http)
+		var idx := i
+		http.request_completed.connect(func(result: int, code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
+			results[idx] = result == HTTPRequest.RESULT_SUCCESS and code < 400
+			http.queue_free()
+			pending[0] -= 1
+		)
+		if http.request(str(nodes[i].get("url", "")) + "/health") == OK:
+			pending[0] += 1
+		else:
+			results[idx] = false
+			http.queue_free()
+	while pending[0] > 0:
+		await get_tree().process_frame
+	return results
+
+
+## Connectivity test for a node definition that may not be saved yet: fetches
+## the asset list so the token is validated too, not just reachability.
+func test_node(url: String, token: String) -> Dictionary:
+	url = url.strip_edges().trim_suffix("/")
+	if url == "":
+		return {"error": "地址为空"}
+	return await _request_node({"url": url, "token": token}, HTTPClient.METHOD_GET, "/assets?limit=1", "", PackedStringArray(), PackedByteArray(), TIMEOUT_META)
 
 
 ## Runs `work` on a background thread and yields each frame until it completes.
@@ -178,6 +248,31 @@ func clear_trash(trunk_id: int = 0) -> Dictionary:
 
 func list_albums() -> Dictionary:
 	return await _do_request(HTTPClient.METHOD_GET, "/albums")
+
+
+## The 散照 bucket of the 相册 (cloud) trunk — where uploads from the device
+## gallery land, so imported photos show up under 红泥相册 → 全部. Resolved from
+## the album list on first use and cached on the instance; 0 when unavailable
+## (offline, or the trunk/bucket is missing).
+func resolve_scatter_album() -> int:
+	if import_album_id > 0:
+		return import_album_id
+	var r: Dictionary = await list_albums()
+	if r.has("error"):
+		return 0
+	var albums: Array = r["data"]["albums"]
+	var trunk_id := 0
+	for a in albums:
+		if a.get("parent_id") == null and str(a.get("name", "")) == "相册":
+			trunk_id = int(a["id"])
+			break
+	if trunk_id <= 0:
+		return 0
+	for a in albums:
+		if int(a.get("parent_id", 0)) == trunk_id and str(a.get("name", "")) in ["散照", "未分类散照"]:
+			import_album_id = int(a["id"])
+			return import_album_id
+	return 0
 
 
 func create_album(name: String, parent_id: int, is_hidden: bool, sync_mode: String) -> Dictionary:
