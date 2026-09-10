@@ -11,6 +11,7 @@ import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.hardware.biometrics.BiometricManager
 import android.hardware.biometrics.BiometricPrompt
+import android.media.AudioAttributes
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.net.Uri
@@ -19,7 +20,9 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.CancellationSignal
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
+import android.util.Log
 import android.view.Gravity
 import android.view.Surface
 import android.view.TextureView
@@ -39,6 +42,8 @@ import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
@@ -80,9 +85,23 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     private var inAppPlayer: MediaPlayer? = null
     private var inAppTextureView: TextureView? = null
     private var inAppBitmap: Bitmap? = null
-    private var inAppFrameSizePx = 0
     private val inAppFrameLock = Any()
+    // Decoded frame target size, set by start_inapp_video. grab_inapp_frame()
+    // always scales the captured frame to this size so GDScript's
+    // Image.create_from_data(W, H, …) always matches the byte length — some
+    // devices return the surface buffer (video resolution) rather than the
+    // requested getBitmap() size, which would otherwise break the transport and
+    // freeze the in-app display.
+    private var inAppFrameW = 0
+    private var inAppFrameH = 0
+    // SystemClock.uptimeMillis() of the last SurfaceTexture update. Used by
+    // GDScript to detect a stalled decode (frozen picture) and hand off to the
+    // OS player; 0 means no update has arrived yet.
+    @Volatile private var inAppLastUpdateMs = 0L
     private var prepared = false
+    // Background video-thumbnail extraction results, drained by GDScript.
+    private val videoThumbQueue = ConcurrentLinkedQueue<Int>()
+    private val videoThumbExecutor = Executors.newFixedThreadPool(2)
 
     // --- Biometric ---
 
@@ -461,9 +480,10 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     // --- In-app video playback (MediaPlayer decoded, frames read back) -------
 
     /**
-     * Starts decoding a local video file. A 1x1 TextureView is attached so the
-     * decode surface stays live while Godot keeps rendering the UI; frames are
-     * polled from GDScript via grab_inapp_frame(). Auto-plays when prepared.
+     * Starts decoding a local video file. A 1x1 on-screen TextureView at the
+     * top-left corner keeps the decode surface live (composited, so its
+     * SurfaceTexture drains and the decoder never stalls) while Godot renders
+     * the video frames via grab_inapp_frame(). Auto-plays when prepared.
      * Returns true when the view was scheduled (playback starts asynchronously).
      */
     @UsedByGodot
@@ -474,12 +494,21 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
             try {
                 val w = if (frameWidth <= 0) 640 else frameWidth.coerceIn(176, 1280)
                 val h = if (frameHeight <= 0) 360 else frameHeight.coerceIn(144, 720)
+                inAppFrameW = w
+                inAppFrameH = h
+                inAppLastUpdateMs = 0L
                 prepared = false
                 val tv = TextureView(activity)
                 tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                     override fun onSurfaceTextureAvailable(st: SurfaceTexture, w0: Int, h0: Int) {
                         try {
                             val mp = MediaPlayer()
+                            mp.setAudioAttributes(
+                                AudioAttributes.Builder()
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .build()
+                            )
                             mp.setDataSource(path)
                             mp.setSurface(Surface(st))
                             mp.setOnPreparedListener { p ->
@@ -487,7 +516,8 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                                 p.start()
                             }
                             mp.setOnCompletionListener { emitSignal("inapp_video_closed") }
-                            mp.setOnErrorListener { _, _, _ ->
+                            mp.setOnErrorListener { _, what, extra ->
+                                Log.e("HongniPlugin", "in-app video error: what=$what extra=$extra path=$path")
                                 emitSignal("inapp_video_closed")
                                 true
                             }
@@ -506,15 +536,21 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                     }
 
                     override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+                        inAppLastUpdateMs = SystemClock.uptimeMillis()
                         val bmp = tv.getBitmap(w, h)
                         if (bmp != null) {
                             synchronized(inAppFrameLock) {
-                                inAppBitmap?.recycle()
                                 inAppBitmap = bmp
                             }
                         }
                     }
                 }
+                // Must stay composited by the RenderThread so the SurfaceTexture
+                // drains: if culled (INVISIBLE, off-screen, alpha 0) the decoder
+                // fills the buffer pool and stalls after ~1 s. Keep it ON-SCREEN
+                // as a 1x1 px corner view — still drawn (drains), while
+                // getBitmap(w, h) reads the producer-set video-resolution frame,
+                // so the tiny view size does not affect the captured pixels.
                 val lp = FrameLayout.LayoutParams(1, 1)
                 lp.gravity = Gravity.TOP or Gravity.START
                 val host = activity.findViewById<ViewGroup>(android.R.id.content)
@@ -586,6 +622,7 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                 inAppBitmap?.recycle()
                 inAppBitmap = null
             }
+            inAppLastUpdateMs = 0L
             prepared = false
         }
         return true
@@ -595,10 +632,18 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
     @UsedByGodot
     fun grab_inapp_frame(): ByteArray {
         synchronized(inAppFrameLock) {
-            val bmp = inAppBitmap ?: return ByteArray(0)
-            val w = bmp.width
-            val h = bmp.height
-            if (w <= 0 || h <= 0) return ByteArray(0)
+            var bmp = inAppBitmap ?: return ByteArray(0)
+            val tw = inAppFrameW
+            val th = inAppFrameH
+            if (tw <= 0 || th <= 0) return ByteArray(0)
+            // Some devices return the surface buffer (video resolution) rather
+            // than the getBitmap(w, h) size; always normalise to the target size
+            // so the byte length exactly matches GDScript's create_from_data(W,H).
+            if (bmp.width != tw || bmp.height != th) {
+                bmp = Bitmap.createScaledBitmap(bmp, tw, th, true)
+            }
+            val w = tw
+            val h = th
             val pixels = IntArray(w * h)
             bmp.getPixels(pixels, 0, w, 0, 0, w, h)
             val out = ByteArray(w * h * 4)
@@ -611,6 +656,79 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
             }
             return out
         }
+    }
+
+    /**
+     * Milliseconds since the SurfaceTexture last produced a frame, or -1 when
+     * none has arrived yet. GDScript watches this while playing: a large value
+     * means the decode/render stalled (frozen picture) even though the player
+     * may keep running, so it can hand off to the OS player.
+     */
+    @UsedByGodot
+    fun inapp_frame_age_ms(): Long {
+        val last = inAppLastUpdateMs
+        if (last == 0L) return -1L
+        return SystemClock.uptimeMillis() - last
+    }
+
+    /**
+     * Requests a video thumbnail (frame extracted from a URL with optional
+     * Bearer token, or a local path) written to destAbsPath. The work runs on a
+     * background thread so the Godot main thread is never blocked; when it
+     * finishes the asset id is pushed to a queue drained by
+     * poll_video_thumb_finished() (positive = ok, negative = failed). Returns
+     * true immediately (the request was scheduled).
+     */
+    @UsedByGodot
+    fun extract_video_thumb(source: String, token: String, destAbsPath: String, sizePx: Int, assetId: Int): Boolean {
+        videoThumbExecutor.execute {
+            val ok = extractVideoThumbSync(source, token, destAbsPath, sizePx)
+            videoThumbQueue.add(if (ok) assetId else -assetId)
+        }
+        return true
+    }
+
+    private fun extractVideoThumbSync(source: String, token: String, destAbsPath: String, sizePx: Int): Boolean {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            if (source.startsWith("http://") || source.startsWith("https://")) {
+                val headers = HashMap<String, String>()
+                if (token.isNotBlank()) headers["Authorization"] = "Bearer $token"
+                retriever.setDataSource(source, headers)
+            } else {
+                retriever.setDataSource(source)
+            }
+            val size = if (sizePx <= 0) 256 else sizePx
+            var frame: Bitmap? = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                frame = retriever.getScaledFrameAtTime(
+                    1_000_000,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                    size,
+                    size,
+                )
+            }
+            if (frame == null) {
+                frame = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            }
+            if (frame == null) return false
+            val cropped = centerCrop(frame, size) ?: return false
+            File(destAbsPath).parentFile?.mkdirs()
+            FileOutputStream(File(destAbsPath)).use { out ->
+                cropped.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            }
+            true
+        } catch (e: Exception) {
+            false
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** Drains and returns the asset ids whose video thumbnails just finished. */
+    @UsedByGodot
+    fun poll_video_thumb_finished(): IntArray {
+        return videoThumbQueue.toIntArray().also { videoThumbQueue.clear() }
     }
 
     /**

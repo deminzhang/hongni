@@ -125,14 +125,20 @@ func _add_cell(i: int, m: Dictionary) -> void:
 	btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_CENTER
 	btn.toggle_mode = true
 	btn.tooltip_text = str(m.get("display_name", ""))
-	# Video cells get a top-left ▶ marker so they're identifiable even when a
+	# Video cells get a centered ▶ marker so they're identifiable even when a
 	# thumbnail (desktop has no video decode path) can't be produced.
 	if m.get("is_video", false):
 		var badge := Label.new()
 		badge.text = "▶"
-		badge.position = Vector2(4, 2)
+		badge.add_theme_font_size_override("font_size", 24)
+		badge.add_theme_color_override("font_color", Color(1, 1, 1, 0.92))
+		var sb := StyleBoxFlat.new()
+		sb.bg_color = Color(0, 0, 0, 0.5)
+		sb.set_corner_radius_all(4)
+		badge.add_theme_stylebox_override("normal", sb)
 		badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		btn.add_child(badge)
+		badge.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
 	_cells.append(btn)  # index-aligned with media[]
 	grid.add_child(btn)
 	btn.pressed.connect(_on_cell_toggled)
@@ -395,7 +401,13 @@ func _import_selected() -> void:
 		if OS.get_name() == "Android":
 			ok = Lock.read_media_bytes(str(m["uri"]), dest)
 		else:
-			ok = DirAccess.copy_absolute(str(m["path"]), dest) == OK
+			# Copying a potentially large video off the main thread.
+			var src := str(m["path"])
+			var res := [false]
+			await Api._bg(func() -> void:
+				res[0] = DirAccess.copy_absolute(src, dest) == OK
+			)
+			ok = res[0]
 			if not ok:
 				step_err = "复制失败"
 		if ok:

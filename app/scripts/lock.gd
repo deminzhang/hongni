@@ -221,6 +221,30 @@ func grab_inapp_frame() -> PackedByteArray:
 	return _plugin().grab_inapp_frame()
 
 
+## ms since the SurfaceTexture last produced a frame, -1 if none yet. Used to
+## detect a stalled in-app decode (frozen picture) and fall back to the OS player.
+func inapp_frame_age_ms() -> int:
+	if not _has_plugin():
+		return -1
+	return int(_plugin().inapp_frame_age_ms())
+
+
+## Requests a video thumbnail (frame from a URL with optional Bearer token, or a
+## local path) into dest_abs_path, on a background thread. Returns immediately.
+func extract_video_thumb(source: String, token: String, dest_abs_path: String, size_px: int, asset_id: int) -> bool:
+	if not _has_plugin():
+		return false
+	return _plugin().extract_video_thumb(source, token, dest_abs_path, size_px, asset_id)
+
+
+## Asset ids whose video thumbnails just finished (positive = ok, negative =
+## failed). Drain this each frame while the grid is up.
+func poll_video_thumb_finished() -> PackedInt32Array:
+	if not _has_plugin():
+		return PackedInt32Array()
+	return _plugin().poll_video_thumb_finished()
+
+
 func open_photo_picker() -> void:
 	if _has_plugin():
 		_plugin().open_photo_picker()

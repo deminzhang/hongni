@@ -46,6 +46,11 @@ var _ctx_asset_ext := ""
 # True once the album list failed to load (offline / weak cloud): thumbnails are
 # then never fetched over the network, so the grid stays instant.
 var _offline := false
+# Video thumbnails are extracted on a background thread (Android). Track which
+# asset ids are in flight (to avoid re-firing) and which failed permanently
+# (never retry this session).
+var _video_thumb_pending: Dictionary = {}
+var _video_thumb_failed: Dictionary = {}
 
 
 func _ready() -> void:
@@ -241,10 +246,10 @@ func _add_cell(a: Dictionary, index: int, gen: int) -> void:
 	# 只存云(本地无原件)→ 云下载角标;两端都有则不标。
 	if not _has_local_original(asset_id, str(a.get("original_name", "")), str(a.get("ext", ""))):
 		_add_badge(btn, "↓")
-	# 视频无服务端缩略图(解码不支持),用左上角 ▶ 标记,便于在网格中识别。
+	# 视频无服务端缩略图(解码不支持),用居中 ▶ 标记,便于在网格中识别。
 	if str(a.get("media_type", "image")) == "video":
-		_add_badge(btn, "▶", Vector2(2, 2))
-	_load_cell_thumb(btn, asset_id, gen)
+		_add_badge(btn, "▶", Vector2.ZERO, true)
+	_load_cell_thumb(btn, asset_id, gen, str(a.get("media_type", "image")))
 
 
 ## A local-only (not yet uploaded) photo cell, shown only in the 全部 view with
@@ -315,29 +320,47 @@ func _has_local_original(asset_id: int, name: String, ext: String = "") -> bool:
 	return false
 
 
-## Overlays a small corner badge (cloud download ⇩ / upload ⇧ at top-right,
-## video ▶ at top-left) on a cell.
-func _add_badge(btn: Control, text: String, pos: Vector2 = Vector2(THUMB_SIZE - 30, 2)) -> void:
+## Overlays a small badge on a cell: cloud download ⇩ / upload ⇧ at top-right
+## (default), or the video ▶ centered over the picture when `centered` is true.
+func _add_badge(btn: Control, text: String, pos: Vector2 = Vector2(THUMB_SIZE - 30, 2), centered: bool = false) -> void:
 	var badge := Label.new()
 	badge.text = text
 	badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	badge.add_theme_font_size_override("font_size", 18)
+	badge.add_theme_font_size_override("font_size", 24 if centered else 18)
 	badge.add_theme_color_override("font_color", Color(1, 1, 1, 0.92))
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = Color(0, 0, 0, 0.5)
 	sb.set_corner_radius_all(4)
 	badge.add_theme_stylebox_override("normal", sb)
-	badge.position = pos
+	if centered:
+		badge.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	else:
+		badge.position = pos
 	btn.add_child(badge)
 
 
 ## Fills a cell thumbnail without blocking the render loop and without waiting
 ## on the network when offline: cached thumbs show immediately, missing ones load
 ## in the background (and are skipped entirely when offline/weak).
-func _load_cell_thumb(btn: TextureButton, asset_id: int, gen: int) -> void:
+func _load_cell_thumb(btn: TextureButton, asset_id: int, gen: int, media_type: String = "image") -> void:
 	var body := Cache.read_thumb(asset_id)
 	if body.is_empty():
 		if _offline:
+			return
+		if media_type == "video" and OS.get_name() == "Android":
+			# The server only stores/serves the blob (no video decode). The
+			# frontend extracts a frame: ensure a LOCAL copy (downloading on
+			# demand), then ask the plugin to extract from that file — reliable
+			# on any device, unlike seeking an HTTP-backed MediaMetadataRetriever.
+			# Runs as a background coroutine; the result lands in the plugin queue
+			# drained by _process -> _poll_video_thumbs().
+			if not _video_thumb_pending.has(asset_id) and not _video_thumb_failed.has(asset_id):
+				_video_thumb_pending[asset_id] = true
+				var name := str(btn.get_meta("asset_name", ""))
+				var ext := str(btn.get_meta("asset_ext", ""))
+				if ext == "":
+					ext = name.get_extension().to_lower()
+				_extract_video_frame(asset_id, name, ext)
 			return
 		var r: Dictionary = await Api.fetch_thumb(asset_id)
 		if r.has("error") or gen != _grid_gen or not is_instance_valid(btn):
@@ -349,6 +372,74 @@ func _load_cell_thumb(btn: TextureButton, asset_id: int, gen: int) -> void:
 	var img := Image.new()
 	if img.load_jpg_from_buffer(body) == OK:
 		btn.texture_normal = ImageTexture.create_from_image(img)
+
+
+## Applies a just-finished video thumbnail (drained from the plugin queue in
+## _process) back onto its grid cell, or fails/ignores accordingly.
+func _poll_video_thumbs() -> void:
+	if OS.get_name() != "Android":
+		return
+	var finished := Lock.poll_video_thumb_finished()
+	if finished.is_empty():
+		return
+	for asset_id in finished:
+		var aid := int(asset_id)
+		var key := absi(aid)
+		_video_thumb_pending.erase(key)
+		if aid <= 0:
+			_video_thumb_failed[key] = true
+			continue
+		var body := Cache.read_thumb(key)
+		if body.is_empty():
+			continue
+		for c in grid.get_children():
+			if c is TextureButton and int(c.get_meta("asset_id", -1)) == key:
+				var img := Image.new()
+				if img.load_jpg_from_buffer(body) == OK:
+					c.texture_normal = ImageTexture.create_from_image(img)
+				break
+
+
+## Downloads a cloud video's original into the local original cache (no-op when
+## already present) and returns its user:// path, "" on failure. Frontend does
+## the work; the server just serves the blob. Marks it viewed so the LRU space
+## policy keeps it (it was just displayed in the grid / will be played).
+func _ensure_video_local(asset_id: int, name: String, ext: String) -> String:
+	if asset_id <= 0:
+		return ""
+	if Cache.original_cached(asset_id, name, ext):
+		Cache.mark_viewed(asset_id)
+		return Cache.original_path(asset_id, name, ext)
+	var r: Dictionary = await Api.fetch_original(asset_id)
+	if r.has("error") or r.get("status", 0) != 200:
+		return ""
+	var body: PackedByteArray = r["body"]
+	if body.is_empty():
+		return ""
+	await Cache.save_original_bg(asset_id, name, body, ext)
+	Cache.mark_viewed(asset_id)
+	return Cache.original_path(asset_id, name, ext)
+
+
+## Local-copy fallback: ensures the video is cached, then asks the plugin to
+## extract a frame from the LOCAL file (no token / no HTTP seek, always reliable).
+## Runs as a fire-and-forget coroutine; the result lands in the same plugin queue
+## that _poll_video_thumbs drains.
+func _extract_video_frame(asset_id: int, name: String, ext: String) -> void:
+	var local := await _ensure_video_local(asset_id, name, ext)
+	if local == "":
+		# Offline / unreachable: leave the ▶ placeholder; retry next open.
+		_video_thumb_pending.erase(asset_id)
+		_video_thumb_failed[asset_id] = true
+		return
+	var dest := ProjectSettings.globalize_path(Cache.thumb_path(asset_id))
+	if not Lock.extract_video_thumb(ProjectSettings.globalize_path(local), "", dest, 256, asset_id):
+		_video_thumb_pending.erase(asset_id)
+		_video_thumb_failed[asset_id] = true
+
+
+func _process(_dt: float) -> void:
+	_poll_video_thumbs()
 
 
 # --- Connectivity hint -------------------------------------------------------

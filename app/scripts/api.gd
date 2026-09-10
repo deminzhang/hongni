@@ -81,6 +81,22 @@ func _do_request(method: int, path: String, body: String = "", extra_headers: Pa
 	return {"status": response_code, "data": parsed, "body": resp_body}
 
 
+## Runs `work` on a background thread and yields each frame until it completes.
+## The main loop stays live (no blocking), so heavy file/CPU work (building a
+## multipart body, copying a large file, etc.) never stalls the UI. `work` must
+## not touch the scene tree/rendering — pure data + file I/O only.
+func _bg(work: Callable) -> void:
+	var done := [false]
+	var t := Thread.new()
+	t.start(func() -> void:
+		work.call()
+		done[0] = true
+	)
+	while not done[0]:
+		await get_tree().process_frame
+	t.wait_to_finish()
+
+
 func check_token() -> Dictionary:
 	return await _do_request(HTTPClient.METHOD_GET, "/assets?limit=1")
 
@@ -102,7 +118,14 @@ func upload_asset(path: String, name: String, media_type: String, taken_at: int,
 	if album_id > 0:
 		fields["album_id"] = album_id
 	var mime := _mime_for(name, media_type)
-	var body := _multipart(boundary, fields, "file", path, name, mime)
+	# Reading the whole file into the multipart body is the heavy part of an
+	# upload (videos are large); build it on a background thread so the main
+	# loop is never blocked.
+	var holder := [PackedByteArray()]
+	await _bg(func() -> void:
+		holder[0] = _multipart(boundary, fields, "file", path, name, mime)
+	)
+	var body: PackedByteArray = holder[0]
 	var headers := PackedStringArray(["Content-Type: multipart/form-data; boundary=" + boundary])
 	return await _do_request(HTTPClient.METHOD_POST, "/assets", "", headers, body, TIMEOUT_FILE)
 
@@ -196,14 +219,6 @@ func fetch_thumb(id: int) -> Dictionary:
 
 func fetch_original(id: int) -> Dictionary:
 	return await _do_request(HTTPClient.METHOD_GET, "/assets/%d/original" % id, "", PackedStringArray(), PackedByteArray(), TIMEOUT_FILE)
-
-
-func thumb_url(id: int) -> String:
-	return "%s/api/v1/assets/%d/thumb" % [Store.server_url(), id]
-
-
-func original_url(id: int) -> String:
-	return "%s/api/v1/assets/%d/original" % [Store.server_url(), id]
 
 
 func _mime_for(name: String, media_type: String) -> String:

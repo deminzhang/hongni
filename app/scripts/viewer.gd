@@ -5,10 +5,17 @@ extends Control
 ## actions.
 
 const SWIPE_THRESHOLD := 80.0
-# In-app MediaPlayer frames are captured at this size and scaled to fit.
-const VIDEO_FRAME_W := 640
-const VIDEO_FRAME_H := 360
-const FRAME_POLL_MS := 0.033
+# In-app MediaPlayer frames are captured at this size and scaled to fit. Lower
+# resolution keeps the per-frame getBitmap() readback light so playback stays
+# smooth; it scales up to the video area on screen.
+const VIDEO_FRAME_W := 480
+const VIDEO_FRAME_H := 270
+const FRAME_POLL_MS := 0.042
+# In-app playback is abandoned for the OS player when no new frame arrives for
+# this long while playing (a stalled decoder). Frames normally arrive at video
+# fps, so a >1.5 s gap means the picture has frozen — hand over quickly rather
+# than leaving the user stuck on a still.
+const STALL_TIMEOUT_MS := 1500
 
 var texture_rect: TextureRect
 var label_name: Label
@@ -25,6 +32,9 @@ var _touch_time := 0
 var _inapp_active := false
 var _inapp_paused := false
 var _frame_accum := 0.0
+# Tick when the in-app player last started; if it stops (errors/completes) very
+# shortly after, we treat it as broken and fall back to the OS player.
+var _inapp_started_ms := 0
 
 
 func _ready() -> void:
@@ -80,17 +90,6 @@ func _build_ui() -> void:
 	btn_save.pressed.connect(_save_to_album)
 	top.add_child(btn_save)
 
-	# Big center ▶ over the video; visible when paused/not started, hidden while
-	# in-app playback runs. Clicking the video area toggles play/pause.
-	btn_center_play = Button.new()
-	btn_center_play.text = "▶"
-	btn_center_play.add_theme_font_size_override("font_size", 64)
-	btn_center_play.custom_minimum_size = Vector2(96, 96)
-	btn_center_play.visible = false
-	btn_center_play.pressed.connect(_on_center_play)
-	add_child(btn_center_play)
-	btn_center_play.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
-
 	label_name = Label.new()
 	label_name.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(label_name)
@@ -102,6 +101,27 @@ func _build_ui() -> void:
 	texture_rect.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	texture_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(texture_rect)
+
+	# Big center ▶ exactly over the video frame; visible when paused/not started,
+	# hidden while in-app playback runs. Centered (and re-centered on resize)
+	# relative to the video area so it always sits over the picture.
+	btn_center_play = Button.new()
+	btn_center_play.text = "▶"
+	btn_center_play.add_theme_font_size_override("font_size", 64)
+	btn_center_play.custom_minimum_size = Vector2(96, 96)
+	btn_center_play.visible = false
+	btn_center_play.pressed.connect(_on_center_play)
+	texture_rect.add_child(btn_center_play)
+	btn_center_play.anchor_left = 0.5
+	btn_center_play.anchor_top = 0.5
+	btn_center_play.anchor_right = 0.5
+	btn_center_play.anchor_bottom = 0.5
+	btn_center_play.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	btn_center_play.grow_vertical = Control.GROW_DIRECTION_BOTH
+	btn_center_play.offset_left = -48
+	btn_center_play.offset_top = -48
+	btn_center_play.offset_right = 48
+	btn_center_play.offset_bottom = 48
 
 	label_status = Label.new()
 	label_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -166,7 +186,7 @@ func _show_current() -> void:
 			is_thumb_fallback = true
 		else:
 			body = r["body"]
-			Cache.save_original(asset_id, name, body, ext)
+			await Cache.save_original_bg(asset_id, name, body, ext)
 	if body.is_empty():
 		label_status.text = "无法加载原图"
 		return
@@ -338,7 +358,7 @@ func _ensure_local_video() -> String:
 			label_status.text = "离线且视频未缓存，无法播放"
 			return ""
 		body = r["body"]
-		Cache.save_original(asset_id, name, body, ext)
+		await Cache.save_original_bg(asset_id, name, body, ext)
 	if body.is_empty():
 		label_status.text = "播放失败：无数据"
 		return ""
@@ -359,6 +379,7 @@ func _start_inapp() -> void:
 		_inapp_active = true
 		_inapp_paused = false
 		_frame_accum = 0.0
+		_inapp_started_ms = Time.get_ticks_msec()
 		_show_center_play(false)
 		label_status.text = ""
 	else:
@@ -392,12 +413,17 @@ func _on_center_play() -> void:
 	_toggle_video_pause()
 
 
-## The plugin finished/errored: drop in-app state and restore the ▶ affordance.
+## The plugin finished/errored: drop in-app state, restore the ▶ affordance.
+## If it died within ~2.5 s of starting (a failure, not a legit short clip),
+## auto-launch the OS external player so the video still plays fully.
 func _on_inapp_closed() -> void:
 	_inapp_active = false
 	_inapp_paused = false
 	_show_center_play(true)
 	label_status.text = "视频"
+	if _inapp_started_ms > 0 and Time.get_ticks_msec() - _inapp_started_ms < 2500:
+		_inapp_started_ms = 0
+		_start_video_external()
 
 
 func _stop_inapp() -> void:
@@ -406,6 +432,7 @@ func _stop_inapp() -> void:
 		_inapp_active = false
 	_inapp_paused = false
 	_frame_accum = 0.0
+	_inapp_started_ms = 0
 
 
 func _show_center_play(show: bool) -> void:
@@ -413,8 +440,17 @@ func _show_center_play(show: bool) -> void:
 
 
 ## Polls the plugin's latest decoded frame and paints it into texture_rect.
+## Also watches the plugin's surface-update age: if no new frame has arrived for
+## STALL_TIMEOUT_MS while playing, the decode/readback has frozen (seen without
+## any MediaPlayer error) — hand over to the OS player instead of a dead still.
 func _process(delta: float) -> void:
 	if not _inapp_active or _inapp_paused:
+		return
+	if Lock.inapp_frame_age_ms() > STALL_TIMEOUT_MS:
+		_stop_inapp()
+		_show_center_play(true)
+		label_status.text = "内置播放无画面，改用系统播放器"
+		_start_video_external()
 		return
 	_frame_accum += delta
 	if _frame_accum < FRAME_POLL_MS:
@@ -455,7 +491,7 @@ func _save_to_album() -> void:
 			btn_save.disabled = false
 			return
 		body = r["body"]
-		Cache.save_original(asset_id, name, body, ext)
+		await Cache.save_original_bg(asset_id, name, body, ext)
 	if body.is_empty():
 		label_status.text = "保存失败：无数据"
 		btn_save.disabled = false

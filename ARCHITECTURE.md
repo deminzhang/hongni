@@ -77,7 +77,7 @@ main.tscn ──未配置──▶ settings.tscn ──保存成功──▶ alb
                               └── 上传 / 新建相册 / 系统相册 / 顶部"更多 ⋮"菜单（最近删除/立即同步/设置）
 albums.tscn ──顶部 相册 按钮 + ⋮ 菜单（隐私相册/最近删除/立即同步/设置）──▶ 相册 | 隐私（两个主干）
 albums.tscn ──相册卡片（多列大图卡）──▶ album_view.tscn（收藏/全部/各子相册）
-album_view.tscn ──点击照片/视频──▶ viewer.tscn（全屏原图、左右滑、删除、加入相册、存到设备相册；视频经外部播放器播放）
+album_view.tscn ──点击照片/视频──▶ viewer.tscn（全屏原图、左右滑、删除、加入相册、存到设备相册；视频 Android 经应用内播放、否则外部播放器）
 albums.tscn ──最近删除──▶ trash.tscn（恢复 / 永久删除 / 清空，主/隐私分离）
 ```
 
@@ -95,7 +95,7 @@ albums.tscn ──最近删除──▶ trash.tscn（恢复 / 永久删除 / 清
 - 空间策略：`settings.json` 的 `cache_clean_enabled`（默认开）与 `cache_min_free_mb`（默认 1024 = 1 GiB）。触发点：打开相册页、每次同步结束、每次缓存新原件。剩余空间低于阈值时按 `last_viewed` 从旧到新删除 `originals/` 下的原件（每个文件都来自云端下载，删除安全）；仍不足时再删除 `user://photos` 中已备份（`sync_index` 有记录且非墓碑）的原件，云端保留权威副本。缩略图与快照永不删除，未备份的本地文件永不删除。
 - 网格/相册卡片缩略图采用**异步占位渲染**：先同步铺满占位、缩略图后台填充，不阻塞主循环；离线/弱联时未缓存缩略图不再发起网络等待（元数据请求用短超时），网格仍即时流畅。
 - 照片 cell 右上角标：`↓` = 只存云（本地无原件，可下载）；`↑` = 仅本地待上传（`user://photos` 未同步，见「全部」视图）。标志只打在照片上，不用于相册卡片。
-- 视频：服务端 `EnsureThumb` 不解码视频（无缩略图），网格 cell 用左上角 `▶` 标记；查看器对视频显示「播放」按钮，先下载原视频到 `user://cache/originals`（复用缓存），再交外部播放器（Android 经 FileProvider 共享为 content:// URI，桌面用默认播放器）。
+- 视频：服务端 `EnsureThumb` 不解码视频（无缩略图），网格 cell 用**居中 `▶`** 标记。抽帧全在前端：`_load_cell_thumb` 先确保**本地副本**（缺则 `Api.fetch_original` 整段下载进 `user://cache/originals`，与查看器缓存复用），再经插件 `extract_video_thumb` 对**本地文件**抽帧，`poll_video_thumb_finished` 回填 cell。查看器下载原视频后 Android 走**应用内播放**：插件用 MediaPlayer（`AudioAttributes` + 1×1 屏幕内 TextureView 保持合成以排空 SurfaceTexture）解码，`grab_inapp_frame()` 把帧统一缩放到目标尺寸后回读渲染到 TextureRect；画面卡住（`inapp_frame_age_ms()` 超时）或早退/报错时自动退化为**外部播放器**（Android 经 FileProvider 共享为 content:// URI，桌面用默认播放器）。
 - `Cache.enforce_cache()` 在内存空间查询失败（返回 0）时不动任何文件。
 
 ### 同步模式
@@ -123,9 +123,11 @@ albums.tscn ──最近删除──▶ trash.tscn（恢复 / 永久删除 / 清
 | `open_photo_picker` | ACTION_PICK_IMAGES |
 | `schedule_backup` / `cancel_backup` / `consume_backup_pending` | WorkManager 周期备份 |
 | `play_video` | 外部播放器（本地文件经 FileProvider 共享为 content:// URI） |
+| `start_inapp_video` / `pause_inapp_video` / `resume_inapp_video` / `stop_inapp_video` / `grab_inapp_frame` / `is_inapp_video_playing` / `inapp_frame_age_ms` | 应用内播放：MediaPlayer 解码到 1×1 屏幕内 TextureView，帧回读；`inapp_frame_age_ms` 供 GDScript 检测画面卡死 |
+| `extract_video_thumb` / `poll_video_thumb_finished` | 后台线程抽视频帧为缩略图，结果入队由 GDScript 排空 |
 | `scan_lan` | NsdManager 发现 `_hongni._tcp` |
 
-信号：`biometric_result` / `photo_picker_result` / `lan_scan_result` / `backup_pending`。
+信号：`biometric_result` / `photo_picker_result` / `lan_scan_result` / `backup_pending` / `inapp_video_closed`。
 
 打包：v2 架构（`@UsedByGodot` + manifest `org.godotengine.plugin.v2.HongniPlugin`），经 `app/addons/hongni_plugin/export_plugin.gd` 注入 Gradle 导出。
 

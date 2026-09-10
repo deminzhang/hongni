@@ -182,6 +182,27 @@ func save_original(asset_id: int, original_name: String, body: PackedByteArray, 
 	enforce_cache.call_deferred()
 
 
+## Like save_original but writes the (possibly large) body on a background
+## thread; callers `await` it. The main loop stays live during the write.
+func save_original_bg(asset_id: int, original_name: String, body: PackedByteArray, ext: String = "") -> void:
+	if asset_id <= 0 or body.is_empty():
+		return
+	var path := original_path(asset_id, original_name, ext)
+	var done := [false]
+	var t := Thread.new()
+	t.start(func() -> void:
+		var f := FileAccess.open(path, FileAccess.WRITE)
+		if f:
+			f.store_buffer(body)
+			f.close()
+		done[0] = true
+	)
+	while not done[0]:
+		await get_tree().process_frame
+	t.wait_to_finish()
+	enforce_cache.call_deferred()
+
+
 func read_original(asset_id: int, original_name: String, ext: String = "") -> PackedByteArray:
 	var f := FileAccess.open(original_path(asset_id, original_name, ext), FileAccess.READ)
 	if f == null:
