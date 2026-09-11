@@ -759,6 +759,8 @@ func _upload_device_album(bucket_id: String, album_name: String, move: bool, tar
 	var failed := 0
 	progress.value = 0.0
 	progress.max_value = float(items.size())
+	# One index write for the whole album instead of one per uploaded photo.
+	Store.begin_batch()
 	for it in items:
 		var r: Dictionary = await Sync.upload_device_item(it, album_id)
 		if int(r.get("asset_id", 0)) > 0:
@@ -766,6 +768,7 @@ func _upload_device_album(bucket_id: String, album_name: String, move: bool, tar
 		else:
 			failed += 1
 		progress.value = float(done.size() + failed)
+	Store.end_batch()
 	progress.max_value = 1.0
 	progress.value = 0.0
 

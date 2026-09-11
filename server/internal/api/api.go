@@ -196,7 +196,17 @@ func (s *server) handleAssetByHash(w http.ResponseWriter, r *http.Request, hash 
 }
 
 func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
+	// Cap the request body as a whole, not just the in-memory part of the form:
+	// ParseMultipartForm spills anything larger than its argument to disk, so
+	// without this one request decides how much of the server's disk to take.
+	// Large videos are still fine, unbounded uploads are not.
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "upload too large")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "bad multipart form: "+err.Error())
 		return
 	}
@@ -223,8 +233,11 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 			albumID = n
 		}
 	}
+	// The client supplies the MIME type and it is echoed back as the
+	// Content-Type of /original, so only media types are accepted: an upload can
+	// never turn the server's own origin into a text/html (or script) host.
 	mime := r.FormValue("mime_type")
-	if mime == "" {
+	if !strings.HasPrefix(mime, "image/") && !strings.HasPrefix(mime, "video/") {
 		mime = defaultMime(name, mediaType)
 	}
 
@@ -281,14 +294,14 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Write blob (no-op if already present) and thumbnail.
-	if err := withReader(tmp, func(r io.Reader) error {
+	if err := withReader(tmp, func(r *os.File) error {
 		return s.blob.Put(hashHex, r)
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	thumbOK := false
-	if err := withReader(tmp, func(r io.Reader) error {
+	if err := withReader(tmp, func(r *os.File) error {
 		var err error
 		thumbOK, err = s.blob.EnsureThumb(hashHex, r)
 		return err
@@ -308,7 +321,7 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if mediaType == "image" {
-		if err := withReader(tmp, func(r io.Reader) error {
+		if err := withReader(tmp, func(r *os.File) error {
 			w0, h0, ok := blob.Dimensions(r)
 			if ok {
 				wi, hi := int64(w0), int64(h0)
@@ -335,7 +348,15 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 	a.ID = id
 
 	if albumID > 0 {
-		_ = s.store.AddAssetToAlbum(r.Context(), albumID, id)
+		// Filing must not be silently skippable: an asset held by no album shows
+		// up in no listing and in no recycle bin. When the link fails, park it in
+		// the trunk's 散照 so the photo is still visible and restorable.
+		if err := s.store.AddAssetToAlbum(r.Context(), albumID, id); err != nil {
+			log.Printf("asset %d: add to album %d failed: %v", id, albumID, err)
+			if perr := s.store.ParkAsset(r.Context(), id); perr != nil {
+				log.Printf("asset %d: parking after failed link also failed: %v", id, perr)
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusCreated, assetResponse{Asset: a, Deduplicated: dedup, Thumb: thumbOK})
@@ -358,6 +379,9 @@ func (s *server) handleOriginal(w http.ResponseWriter, r *http.Request, id int64
 	}
 	defer rc.Close()
 	w.Header().Set("Content-Type", a.MimeType)
+	// The bytes are user content: never let a browser sniff them into something
+	// executable on this origin.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Length", strconv.FormatInt(a.Size, 10))
 	_, _ = io.Copy(w, rc)
 }
@@ -379,6 +403,7 @@ func (s *server) handleThumb(w http.ResponseWriter, r *http.Request, id int64) {
 	}
 	defer rc.Close()
 	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = io.Copy(w, rc)
 }
 
@@ -456,6 +481,11 @@ func (s *server) handleAssetPatch(w http.ResponseWriter, r *http.Request) {
 }
 
 const trashRetentionSecs = 30 * 24 * 3600
+
+// Largest upload the server accepts in one request (4 GiB). Comfortably above
+// any phone video, and the point where "the client is wrong" stops being a
+// better explanation than "the disk is about to fill up".
+const maxUploadBytes = 4 << 30
 
 // handleListTrash lists the recycle bin, optionally for one trunk, lazily
 // purging assets older than the 30-day retention window first.
@@ -865,9 +895,12 @@ func osRemove(f *os.File) {
 	_ = os.Remove(f.Name())
 }
 
-// withReader reopens the temp file read-only and passes a reader to fn,
-// closing it afterwards. The file must have been written and closed first.
-func withReader(f *os.File, fn func(io.Reader) error) error {
+// withReader reopens the temp file read-only and passes it to fn, closing it
+// afterwards. The file must have been written and closed first. The handle (not
+// a narrowed io.Reader) is handed over so decoders that must look before they
+// leap — EnsureThumb reads the header, then seeks back for the full decode —
+// can do so on the same open file.
+func withReader(f *os.File, fn func(*os.File) error) error {
 	rc, err := os.Open(f.Name())
 	if err != nil {
 		return err

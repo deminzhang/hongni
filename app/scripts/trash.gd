@@ -1,8 +1,9 @@
 extends Control
 ## 最近删除 (recycle bin) for the active trunk. Photos soft-deleted from the
-## active set land here for a 7-day restore window. Tapping an item offers
-## 恢复 or 永久删除; the header 清空 empties the trunk bin. 主相册 and 隐私 have
-## independent bins (per-trunk provenance recorded at delete time).
+## active set land here for the 30-day restore window (server-side retention in
+## api.go). Tapping an item offers 恢复 or 永久删除; the header 清空 empties the
+## trunk bin. 主相册 and 隐私 have independent bins (per-trunk provenance
+## recorded at delete time).
 
 const THUMB_SIZE := 140
 const RENDER_CHUNK := 150
@@ -187,15 +188,61 @@ func _restore(asset_id: int) -> void:
 	_refresh_grid.call_deferred()
 
 
+## 永久删除 is the one irreversible action in the app — there is no bin behind it
+## and the blob goes with the row — so it asks first, the same way deleting a
+## non-empty album does. Everything else (grid 删除, 从本机删除) is recoverable
+## enough to fire on the tap.
 func _delete_forever(asset_id: int) -> void:
-	await Api.delete_trash(asset_id)
+	var popup := ConfirmationDialog.new()
+	popup.title = "永久删除"
+	popup.ok_button_text = "永久删除"
+	popup.dialog_text = "永久删除这一项？云端文件立即删除，无法恢复。"
+	popup.confirmed.connect(_do_delete_forever.bind(popup, asset_id))
+	popup.canceled.connect(popup.queue_free)
+	add_child(popup)
+	popup.popup_centered()
+
+
+func _do_delete_forever(popup: ConfirmationDialog, asset_id: int) -> void:
+	if is_instance_valid(popup):
+		popup.queue_free()
+	var r: Dictionary = await Api.delete_trash(asset_id)
+	if r.has("error"):
+		status_label.text = "永久删除失败：" + str(r["error"])
+		return
 	Cache.remove_original_by_id(asset_id)
 	Cache.remove_thumb_by_id(asset_id)
 	_refresh_grid.call_deferred()
 
 
 func _clear_all() -> void:
-	await Api.clear_trash(_trunk_id)
+	if _assets_full.is_empty():
+		return
+	var popup := ConfirmationDialog.new()
+	popup.title = "清空最近删除"
+	popup.ok_button_text = "清空"
+	popup.dialog_text = "清空「%s」的最近删除？其中 %d 项将被永久删除，无法恢复。" % [
+		_trunk_name, _assets_full.size(),
+	]
+	popup.confirmed.connect(_do_clear_all.bind(popup))
+	popup.canceled.connect(popup.queue_free)
+	add_child(popup)
+	popup.popup_centered()
+
+
+func _do_clear_all(popup: ConfirmationDialog) -> void:
+	if is_instance_valid(popup):
+		popup.queue_free()
+	var r: Dictionary = await Api.clear_trash(_trunk_id)
+	if r.has("error"):
+		status_label.text = "清空失败：" + str(r["error"])
+		return
+	# Gone for good, so what the cache kept for recycle-bin browsing is dead
+	# weight now: drop this trunk's cached originals and thumbnails with them.
+	for a in _assets_full:
+		var id := int(a.get("id", 0))
+		Cache.remove_original_by_id(id)
+		Cache.remove_thumb_by_id(id)
 	_refresh_grid.call_deferred()
 
 

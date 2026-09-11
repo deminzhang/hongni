@@ -288,6 +288,13 @@ func enforce_cache() -> void:
 		if DirAccess.remove_absolute(it["path"]) == OK:
 			free = free_space_bytes()
 
+	# Still short: the device-side caches are regenerable too (a device thumbnail
+	# is decoded again, a device video copy re-read from MediaStore), so they are
+	# evictable under the same policy. DeviceMedia owns those directories and does
+	# the removing; this singleton keeps owning the policy.
+	if free < threshold:
+		DeviceMedia.evict_cached_files(threshold)
+
 
 ## Cache stats for the settings screen: {count, bytes}.
 func originals_stats() -> Dictionary:

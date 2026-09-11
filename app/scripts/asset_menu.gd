@@ -2,8 +2,8 @@ extends Control
 ## Shared per-asset action menu, used by both the album photo grid and the
 ## full-screen viewer. Owns:
 ##   - the rightmost ⋮ PopupMenu. Cloud assets get 收藏 / 移动到 / 复制到 /
-##     设为相册封面 / 重命名 / 删除 / 保留云端 / 详细. Device (系统相册) media gets
-##     移动到 / 复制到 / 保留云端 / 从本机删除 / 详细 — there the device owns
+##     设为相册封面 / 重命名 / 删除 / 删本地保云端 / 详细. Device (系统相册) media gets
+##     移动到 / 复制到 / 删本地保云端 / 从本机删除 / 详细 — there the device owns
 ##     the file, so every action either pushes a copy into the cloud or asks the
 ##     platform to remove the device's own file.
 ##   - the target picker those 移动/复制 entries need: either of the two cloud
@@ -12,7 +12,9 @@ extends Control
 ##
 ## Call `setup(host, source_album)` once, then `popup(assets)` with the target
 ## assets. Mutations are reported through `changed(ids, op)` so the owner can
-## refresh itself, and through `notice(text)` for user-facing one-liners.
+## refresh itself, and through `notice(text)` for user-facing one-liners —
+## except 删本地保云端, which reports a notice only and leaves the screen as it is
+## (see `_delete_local_keep_cloud`).
 
 signal changed(ids: Array, op: String)
 signal notice(text: String)
@@ -111,11 +113,12 @@ func popup(assets: Array, at := Vector2.INF) -> void:
 func _device_menu(single: bool) -> void:
 	_menu.add_item("移动到", MenuId.MOVE)
 	_menu.add_item("复制到", MenuId.COPY)
-	_menu.add_item(_keep_label(), MenuId.KEEP)
+	_menu.add_item("删本地保云端", MenuId.KEEP)
 	_menu.add_item("从本机删除", MenuId.DELETE_DEVICE)
 	_menu.add_item("详细", MenuId.DETAILS)
-	# 保留 is about the cloud copy that already exists, so it needs a single,
-	# already-backed-up item; 详细 describes one item.
+	# 删本地保云端 needs the cloud copy that already exists (there is nothing to
+	# pin otherwise), so it needs a single, already-backed-up item; 详细
+	# describes one item.
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.KEEP), not single or _keep_target_id(_targets[0]) <= 0)
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.DETAILS), not single)
 
@@ -128,7 +131,7 @@ func _cloud_menu(single: bool) -> void:
 	_load_favorites()
 	var cloud := _as_int(_targets[0].get("id")) > 0
 	var image := str(_targets[0].get("media_type", "image")) == "image"
-	var fav_view := _in_favorites()
+	var fav_view := in_favorites_view()
 	_menu.add_item(_fav_label(), MenuId.FAV_TOGGLE)
 	if not fav_view:
 		_menu.add_item("移动到", MenuId.MOVE)
@@ -137,7 +140,7 @@ func _cloud_menu(single: bool) -> void:
 	_menu.add_item("重命名", MenuId.RENAME)
 	if not fav_view:
 		_menu.add_item("删除", MenuId.DELETE)
-	_menu.add_item(_keep_label(), MenuId.KEEP)
+	_menu.add_item("删本地保云端", MenuId.KEEP)
 	_menu.add_item("详细", MenuId.DETAILS)
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.FAV_TOGGLE), not cloud)
 	_set_item_disabled(MenuId.MOVE, not cloud)
@@ -151,9 +154,12 @@ func _cloud_menu(single: bool) -> void:
 	_menu.set_item_disabled(_menu.get_item_index(MenuId.DETAILS), not single)
 
 
-## True when the grid/viewer is showing the 收藏 card. Its id is only known once
-## the album list has been read, so an unknown id means "not 收藏".
-func _in_favorites() -> bool:
+## True when the album being browsed is 收藏 itself. Its id is only known once
+## the album list has been read, so an unknown id means "not 收藏". The grid's ⋮
+## menu and the viewer's own 删除 button both ask this: 收藏 is a starred view, and
+## a photo deleted or moved out of a view is a photo on its way to being filed
+## nowhere.
+func in_favorites_view() -> bool:
 	return Api.favorite_album_id > 0 and Api.current_album_id == Api.favorite_album_id
 
 
@@ -188,7 +194,7 @@ func _on_menu(id: int) -> void:
 		MenuId.DETAILS:
 			_show_details()
 		MenuId.KEEP:
-			_toggle_keep()
+			await _delete_local_keep_cloud()
 		MenuId.DELETE_DEVICE:
 			await _delete_device_items()
 
@@ -214,6 +220,9 @@ func delete_assets(assets: Array) -> void:
 	var scope := Api.current_album_id
 	var ids: Array = []
 	var offline := false
+	# Offline deletes queue one tombstone each; batch so the index/settings file
+	# is written once for the whole selection.
+	Store.begin_batch()
 	for a in list:
 		var id := _as_int(a["id"])
 		var r: Dictionary = await Api.delete_asset(id, scope)
@@ -225,6 +234,7 @@ func delete_assets(assets: Array) -> void:
 			# 整个资产进了回收站，本机留着的原件与索引才真的没用了。
 			Sync.remove_local(id)
 		ids.append(id)
+	Store.end_batch()
 	if offline:
 		notice.emit("已标记删除 %d 项，联网后同步删除" % ids.size())
 	changed.emit(ids, "delete")
@@ -242,39 +252,71 @@ func local_source_path(a: Dictionary) -> String:
 	return ""
 
 
-# --- 保留云端 ----------------------------------------------------------------
+# --- 删本地保云端 -------------------------------------------------------------
 
-## The cloud asset a 保留 pin would apply to: a device item's backed-up copy, or
-## the cloud asset itself. 0 when there is nothing in the cloud to pin.
+## The cloud asset the pin applies to: a device item's backed-up copy, or the
+## cloud asset itself. 0 when there is nothing in the cloud to pin.
 func _keep_target_id(a: Dictionary) -> int:
 	if DeviceMedia.is_device(a):
 		return Sync.backed_up_asset_id(a)
 	return _as_int(a.get("id"))
 
 
-func _keep_label() -> String:
-	if _targets.size() == 1 and Store.is_kept(_keep_target_id(_targets[0])):
-		return "取消保留云端"
-	return "保留云端"
-
-
-## Pins 本机删除后云端保留. This is the only exemption from the delete mirror:
-## without it, removing a photo from the system gallery deletes the cloud copy
-## too (into the recycle bin, restorable for 30 days).
-func _toggle_keep() -> void:
+## ⋮ → 删本地保云端: free the phone's copy now, keep the cloud's — no toggle, no
+## way back (the local original comes again by itself: cloud assets re-fetch it
+## on demand the next time one is opened). The pin (`Store.is_kept`) is what
+## makes the cloud survive — without it the next sync mirrors the missing file
+## into the recycle bin (restorable for 30 days); with it the sync only drops the
+## index entry. The original goes immediately: a cloud asset loses its cached
+## full-res download, a device item its own file (the system confirmation still
+## governs, as always). Thumbnails and album membership are not originals and
+## stay either way. Nothing here re-renders the screen: the cell keeps its place
+## and its thumbnail until the grid is rebuilt, so 下次重新查看 is when the new
+## state appears.
+func _delete_local_keep_cloud() -> void:
 	if _targets.size() != 1:
 		return
-	var id := _keep_target_id(_targets[0])
-	if id <= 0:
+	var a: Dictionary = _targets[0]
+	var cloud_id := _keep_target_id(a)
+	if cloud_id <= 0:
 		notice.emit("该项还没有云端副本可保留")
 		return
-	var keep := not Store.is_kept(id)
-	Store.set_kept(id, keep)
-	if keep:
-		notice.emit("已标记保留：本机删除后云端保留")
+	if DeviceMedia.is_device(a):
+		await _delete_device_keeping_cloud([a])
+		return
+	Store.set_kept(cloud_id, true)
+	if local_source_path(a) == "":
+		notice.emit("本机没有原图可删除；云端已标记保留")
+		return
+	Cache.remove_original_by_id(cloud_id)
+	notice.emit("已删除本机原图，云端保留；下次查看时重新下载")
+
+
+## 删本地保云端 on 系统相册 media: hand the device's own files to the platform and
+## pin the cloud copies of the ones that really went away — the system dialog
+## decides, and a declined one leaves everything, pin included, in place. No
+## `changed` for the same reason as the cloud path: the cell stays until the
+## grid is rebuilt.
+func _delete_device_keeping_cloud(items: Array) -> void:
+	var pins: Dictionary = {}
+	var list: Array = []
+	for a in items:
+		if DeviceMedia.is_device(a):
+			list.append(a)
+			pins[DeviceMedia.key_of(a)] = _keep_target_id(a)
+	if list.is_empty():
+		return
+	var gone := await DeviceMedia.delete_items(list)
+	var pinned := 0
+	for k in gone:
+		var cloud_id := int(pins.get(str(k), 0))
+		if cloud_id > 0:
+			Store.set_kept(cloud_id, true)
+			pinned += 1
+	if pinned == 0:
+		notice.emit("未从本机删除任何项（已取消或失败）")
 	else:
-		notice.emit("已取消保留标记")
-	changed.emit([id], "keep")
+		notice.emit("已删除本机 %d 项，云端保留；下次查看时刷新" % pinned)
 
 
 # --- 从本机删除 (device media) -----------------------------------------------
@@ -442,13 +484,19 @@ func _apply_move_copy(target: Dictionary, move: bool) -> void:
 	var pushed: Array = []
 	var failed := 0
 
+	# Uploads write a sync-index entry each; one write for the whole selection.
+	Store.begin_batch()
 	for a in _targets:
 		if DeviceMedia.is_device(a):
 			if kind == TargetKind.DEVICE:
 				continue  # already on the device
 			var album_id := await Api.resolve_scatter_album(trunk)
 			if trunk == Api.TRUNK_CLOUD:
-				album_id = await Api.resolve_device_album(str(a.get("bucket_name", "")))
+				# 按设备相册名归位；解析不出来（离线/主干缺失）时保留上面刚拿到的
+				# 散照，别把一个已经可用的落点清零。
+				var by_name := await Api.resolve_device_album(str(a.get("bucket_name", "")))
+				if by_name > 0:
+					album_id = by_name
 			# Backs the item up into `album_id` and links it in the sync index, so
 			# the grid marks it ☁ 已备份 and the next sync leaves it alone. Bytes
 			# the cloud already holds are linked rather than sent again; the
@@ -475,6 +523,7 @@ func _apply_move_copy(target: Dictionary, move: bool) -> void:
 			ids.append(asset_id)
 		else:
 			failed += 1
+	Store.end_batch()
 
 	# 移动 out of the device gallery only deletes the device's own file once the
 	# cloud copy actually exists.

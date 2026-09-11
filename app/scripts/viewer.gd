@@ -304,7 +304,9 @@ func _show_current() -> void:
 		texture_rect.texture = null
 		label_status.text = "本地待上传 · 尚未同步到云端"
 		return
-	btn_delete.visible = true
+	# 收藏 里不提供 删除/移动到/复制（见 asset_menu.in_favorites_view）：viewer 的
+	# 删除按钮是另一条入口，必须和 ⋮ 菜单一致，否则从收藏点进来看大图就绕过去了。
+	btn_delete.visible = not asset_menu.in_favorites_view()
 	var name := str(a.get("original_name", ""))
 	var ext := str(a.get("ext", ""))
 	var mime: String = a.get("mime_type", "image/jpeg")

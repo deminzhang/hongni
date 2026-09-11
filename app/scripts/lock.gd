@@ -200,7 +200,7 @@ func load_media_preview(uri: String, dest_abs_path: String, max_px: int) -> bool
 
 
 ## Writes an image file (absolute path) into the device system album
-## (Pictures/Hongni). Android-only; false on desktop/editor.
+## (Pictures/红泥). Android-only; false on desktop/editor.
 func save_to_gallery(src_abs_path: String, display_name: String, mime_type: String) -> bool:
 	if not _has_plugin():
 		return false

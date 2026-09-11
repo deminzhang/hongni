@@ -35,6 +35,28 @@ var import_album_id: int = 0
 
 const API_PATH := "/api/v1"
 
+# Cap on requests in flight at once. A grid renders a chunk of cells at a time
+# and every uncached thumbnail is its own request, so without a cap opening an
+# album fires 150+ sockets simultaneously — on a weak or absent server that is a
+# burst of parallel timeouts rather than one clean failure, and it starves the
+# requests that matter (a sync upload, the viewer's original). Surplus requests
+# wait a frame at a time for a slot; heavy transfers share the same cap, which is
+# free because their callers issue them one at a time.
+const MAX_CONCURRENT_REQUESTS := 6
+var _inflight := 0
+
+
+## Takes a concurrency slot, waiting while the cap is reached. Every call must be
+## paired with _release_slot() on the way out.
+func _acquire_slot() -> void:
+	while _inflight >= MAX_CONCURRENT_REQUESTS:
+		await get_tree().process_frame
+	_inflight += 1
+
+
+func _release_slot() -> void:
+	_inflight = maxi(0, _inflight - 1)
+
 ## The 相册 trunk's buckets that hold un-filed photos.
 const SCRATCH_BUCKETS := ["散照", "未分类散照"]
 ## Names that already mean something inside a trunk: a device album called 收藏
@@ -57,6 +79,15 @@ var _trunk_scatter: Dictionary = {}
 ## the node that answered last is tried first, then the rest in priority order.
 ## The first node that answers (even with an HTTP error status) becomes active.
 func _do_request(method: int, path: String, body: String = "", extra_headers: PackedStringArray = PackedStringArray(), body_raw: PackedByteArray = PackedByteArray(), timeout: float = TIMEOUT_META) -> Dictionary:
+	await _acquire_slot()
+	var out: Dictionary = await _do_request_slot_held(method, path, body, extra_headers, body_raw, timeout)
+	_release_slot()
+	return out
+
+
+## `_do_request` body, with a concurrency slot already held by the caller. Kept
+## separate so every return path above releases its slot exactly once.
+func _do_request_slot_held(method: int, path: String, body: String, extra_headers: PackedStringArray, body_raw: PackedByteArray, timeout: float) -> Dictionary:
 	var nodes := Store.servers()
 	if nodes.is_empty():
 		return {"error": "未配置服务器", "status": 0}

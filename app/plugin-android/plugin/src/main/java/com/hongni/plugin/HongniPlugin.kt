@@ -198,6 +198,23 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
 
     // --- MediaStore ---
 
+    /** Rows one list_media() call may return; the caller keeps paging. */
+    private val mediaPageSize = 500
+
+    /**
+     * One page of MediaStore items, ordered by ascending `_ID`.
+     *
+     * `after_cursor` is the `_ID` the previous page ended on ("" for the first),
+     * and paging is by `_ID ASC` because the `_ID > ?` filter can only enumerate
+     * every row when the ordering agrees with it — the client re-sorts by
+     * capture time anyway. `media` is "image", "video" or "all"; "all" reads two
+     * collections against one page budget and is only for one-shot use.
+     *
+     * Callers MUST keep calling until a page comes back empty. The gallery
+     * routinely holds tens of thousands of items, and a list truncated at a page
+     * boundary is indistinguishable from a gallery the user emptied — which is
+     * exactly what the delete mirror acts on (see DeviceMedia.scan_is_complete).
+     */
     @UsedByGodot
     fun list_media(after_cursor: String, media: String): String {
         val activity = getActivity() ?: return "[]"
@@ -217,7 +234,7 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
             )
         }
         val afterId = after_cursor.toLongOrNull() ?: 0L
-        val sort = "${MediaStore.MediaColumns.DATE_TAKEN} DESC"
+        val sort = "${MediaStore.MediaColumns._ID} ASC"
         try {
             for (uri in uris) {
                 val isVideo = uri == MediaStore.Video.Media.EXTERNAL_CONTENT_URI
@@ -247,7 +264,7 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                     val durationIdx = c.getColumnIndex(MediaStore.MediaColumns.DURATION)
                     val bucketIdIdx = c.getColumnIndex(MediaStore.MediaColumns.BUCKET_ID)
                     val bucketNameIdx = c.getColumnIndex(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME)
-                    while (c.moveToNext() && items.length() < 1000) {
+                    while (c.moveToNext() && items.length() < mediaPageSize) {
                         val id = c.getLong(idIdx)
                         val contentUri = uri.buildUpon().appendPath(id.toString()).build().toString()
                         val o = JSONObject()
@@ -571,7 +588,7 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                     put(MediaStore.Images.Media.MIME_TYPE, mime)
                     put(
                         MediaStore.Images.Media.RELATIVE_PATH,
-                        Environment.DIRECTORY_PICTURES + "/Hongni",
+                        Environment.DIRECTORY_PICTURES + "/红泥",
                     )
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
@@ -601,7 +618,7 @@ class HongniPlugin(godot: Godot) : GodotPlugin(godot) {
                 ensureWritePermission(activity)
                 val dir =
                     Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-                val sub = File(dir, "Hongni")
+                val sub = File(dir, "红泥")
                 if ((!sub.exists() && !sub.mkdirs()) || !sub.isDirectory) return false
                 val outFile = File(sub, name)
                 file.inputStream().use { i -> outFile.outputStream().use { o -> i.copyTo(o) } }

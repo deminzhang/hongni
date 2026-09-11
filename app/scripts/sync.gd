@@ -12,7 +12,7 @@ extends Node
 ## the album mirroring the device album each item came from.
 ##
 ## Deletes mirror the device: an indexed item the gallery no longer reports is
-## soft-deleted into the cloud's 7-day recycle bin. Remote changes are pulled
+## soft-deleted into the cloud's 30-day recycle bin. Remote changes are pulled
 ## into the local viewing cache (thumbnail on create, original on demand), and
 ## deletes that happened offline are retried from the tombstone queue.
 
@@ -138,9 +138,9 @@ func run_sync() -> void:
 	running = false
 	Cache.enforce_cache()
 	var message := "同步完成：上传 %d" % uploaded
-	if int(mirror["pruned"]) > 0:
-		message += " · 同步删除 %d" % int(mirror["pruned"])
-	if int(mirror["kept"]) > 0:
+	if int(mirror.get("deleted", 0)) > 0:
+		message += " · 同步删除 %d" % int(mirror["deleted"])
+	if int(mirror.get("kept", 0)) > 0:
 		message += " · 保留 %d" % int(mirror["kept"])
 	backup_finished.emit(true, message)
 
@@ -154,6 +154,8 @@ func _upload_phase(sources: Array) -> int:
 	var done := 0
 	var uploaded := 0
 	progress_changed.emit(done, total)
+	# One index write for the whole pass instead of one per uploaded file.
+	Store.begin_batch()
 	for s in sources:
 		var existing := Store.find_index_entry(str(s["local_id"]))
 		if not existing.is_empty() \
@@ -171,17 +173,19 @@ func _upload_phase(sources: Array) -> int:
 			uploaded += 1
 		done += 1
 		progress_changed.emit(done, total)
+	Store.end_batch()
 	return uploaded
 
 
 ## Mirrors device deletions into the cloud: an indexed item the gallery no longer
-## reports is soft-deleted (7-day recycle bin, restorable) and dropped from the
+## reports is soft-deleted (30-day recycle bin, restorable) and dropped from the
 ## index. Returns how many were pruned and how many were held back by a 保留 pin.
 ##
 ## Deletes cloud data, so it refuses any scan it cannot trust as a statement
-## about the whole gallery: an empty result, or one taken without full media
-## access (Android 14 can grant a hand-picked subset of photos), means the read
-## failed or is partial — not that the user deleted their library.
+## about the whole gallery: an empty result, one taken without full media access
+## (Android 14 can grant a hand-picked subset of photos), or one that stopped at
+## a page boundary (see DeviceMedia.scan_is_complete) all mean the read failed or
+## is partial — not that the user deleted their library.
 func _prune_device_deletions(sources: Array) -> Dictionary:
 	var indexed: Dictionary = {}
 	for e in Store.sync_index:
@@ -207,6 +211,12 @@ func _prune_device_deletions(sources: Array) -> Dictionary:
 				claimed[cid] = true
 	var pruned := 0
 	var held := 0
+	# `deleted` counts what actually went into the cloud recycle bin, `pruned` the
+	# index entries that went away — an entry can be dropped without a delete
+	# (never uploaded, or another live item claims the same asset), and reporting
+	# those as deletions would overstate what the pass did.
+	var deleted := 0
+	Store.begin_batch()
 	for lid in indexed:
 		var key := str(lid)
 		if live.has(key):
@@ -222,9 +232,11 @@ func _prune_device_deletions(sources: Array) -> Dictionary:
 			if r.has("error"):
 				continue  # cloud unreachable: keep the entry, retry next sync
 			Cache.remove_original_by_id(asset_id)
+			deleted += 1
 		Store.erase_index_entry(key)
 		pruned += 1
-	return {"pruned": pruned, "kept": held}
+	Store.end_batch()
+	return {"pruned": pruned, "deleted": deleted, "kept": held}
 
 
 ## Retries queued cloud deletes (tombstones). Keeps them when still offline. An
@@ -236,6 +248,7 @@ func _process_pending_deletes() -> void:
 	if not (pending is Array) or pending.is_empty():
 		return
 	var remaining: Array = []
+	Store.begin_batch()
 	for entry in pending:
 		var cid := int(entry.get("id", 0)) if entry is Dictionary else int(entry)
 		var album_id := int(entry.get("album_id", 0)) if entry is Dictionary else 0
@@ -248,6 +261,7 @@ func _process_pending_deletes() -> void:
 			remove_local(cid)
 	Store.settings["pending_deletes"] = remaining
 	Store.save_settings()
+	Store.end_batch()
 
 
 ## Pulls remote changes since last_cursor. asset create -> cache thumbnail (the
@@ -326,6 +340,8 @@ func export_assets_to_device(assets: Array, move: bool) -> Dictionary:
 	var written := 0
 	var skipped_video := 0
 	var failed := 0
+	# A move drops one index entry per file; batch them into one write.
+	Store.begin_batch()
 	for a in assets:
 		var id := int(a.get("id", 0))
 		if id <= 0:
@@ -367,6 +383,7 @@ func export_assets_to_device(assets: Array, move: bool) -> Dictionary:
 		if move:
 			await Api.delete_asset(id)
 			remove_local(id)
+	Store.end_batch()
 	return {"written": written, "skipped_video": skipped_video, "failed": failed}
 
 

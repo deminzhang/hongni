@@ -67,11 +67,67 @@ func _migrate_legacy_server() -> bool:
 	return changed or JSON.stringify(cleaned) != JSON.stringify(list)
 
 
+## Persists the settings JSON now, or marks them dirty when a batch is open.
 func save_settings() -> void:
+	_settings_dirty = true
+	if _batch_depth == 0:
+		_write_settings()
+
+
+func _write_settings() -> void:
+	_settings_dirty = false
 	var f := FileAccess.open(SETTINGS_PATH, FileAccess.WRITE)
 	if f:
 		f.store_string(JSON.stringify(settings, "  "))
 		f.close()
+
+
+# --- Batched persistence -----------------------------------------------------
+#
+# The in-memory state is what the running session reads, so a write can wait: a
+# sync pass touches the index once per file, and writing the whole array each
+# time is O(n²) bytes for a gallery of any size (the large-file end of this app's
+# target). begin_batch()/end_batch() around a loop collapses that into one write;
+# nesting is counted, so callers can wrap freely.
+#
+# Losing an unflushed write is safe by construction: an index entry that never
+# reached disk is simply re-linked (or re-uploaded and deduplicated server-side)
+# on the next pass, and settings fall back to their previous value — the failure
+# direction is extra work, never lost photos.
+
+var _batch_depth := 0
+var _settings_dirty := false
+var _index_dirty := false
+
+
+func begin_batch() -> void:
+	_batch_depth += 1
+
+
+func end_batch() -> void:
+	_batch_depth = maxi(0, _batch_depth - 1)
+	if _batch_depth == 0:
+		flush()
+
+
+## Writes whatever the open batch left pending. Called automatically when the
+## innermost batch closes and when the autoload goes away.
+func flush() -> void:
+	if _settings_dirty:
+		_write_settings()
+	if _index_dirty:
+		_write_sync_index()
+
+
+func _exit_tree() -> void:
+	flush()
+
+
+## A backgrounded app can be killed without further notice, so what an open batch
+## is still holding gets persisted when the platform takes the app away.
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_PAUSED or what == NOTIFICATION_WM_CLOSE_REQUEST:
+		flush()
 
 
 ## Server nodes, highest priority first. Always returns an Array of normalized
@@ -209,10 +265,19 @@ func load_sync_index() -> void:
 	_index_stale = true
 
 
+## Persists the index now, or marks it dirty when a batch is open (see
+## begin_batch). The index is machine state, so it is written compactly.
 func save_sync_index() -> void:
+	_index_dirty = true
+	if _batch_depth == 0:
+		_write_sync_index()
+
+
+func _write_sync_index() -> void:
+	_index_dirty = false
 	var f := FileAccess.open(SYNC_INDEX_PATH, FileAccess.WRITE)
 	if f:
-		f.store_string(JSON.stringify(sync_index, "  "))
+		f.store_string(JSON.stringify(sync_index))
 		f.close()
 
 

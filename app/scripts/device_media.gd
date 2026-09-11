@@ -44,6 +44,10 @@ const DECODABLE_EXTS := ["jpg", "jpeg", "png", "webp", "bmp"]
 
 var _items: Array = []
 var _albums: Array = []
+# Cleared at the start of every scan and set only by one that reached the end of
+# the device listing; read through scan_is_complete(). Defaults to false so a
+# scan that never ran cannot be mistaken for a complete one.
+var _scan_complete := false
 
 # Desktop thumbnail worker: Android decodes through the plugin on the calling
 # thread (the bridge is main-thread only), desktop must not decode a multi-MB
@@ -93,11 +97,14 @@ func scan_items() -> Array:
 	return items
 
 
-## Whether a scan covers the whole gallery: on Android 14+ the user can grant a
-## hand-picked subset of photos, and a scan listing only those is no evidence
-## about the ones it leaves out. Desktop reads the folder directly, so it does.
+## Whether the last scan covers the whole gallery. Two things can make it
+## partial, and both must be false before a "the device no longer lists it" read
+## is allowed to delete anything: on Android 14+ the user can grant a hand-picked
+## subset of photos (a scan listing only those says nothing about the rest), and
+## a paged scan can stop early (see _collect_android_kind). Desktop reads the
+## folder directly, so it is complete as soon as it returns.
 func scan_is_complete() -> bool:
-	return Lock.has_full_media_access()
+	return _scan_complete and Lock.has_full_media_access()
 
 
 ## Albums in newest-first order: [{id, name, count, cover}] where `cover` is the
@@ -135,39 +142,80 @@ func decodes_in_caller() -> bool:
 
 
 func _collect() -> Array:
+	_scan_complete = false
 	if OS.get_name() == "Android":
 		return _collect_android()
+	# One read of the Pictures folder IS the whole gallery.
+	_scan_complete = true
 	return _collect_pictures()
 
 
+## The device gallery: both MediaStore collections, each paged to exhaustion.
+## The plugin returns one page per call, so this loop is what makes a large
+## gallery whole — an unread tail is indistinguishable from a gallery the user
+## emptied, and the sync engine mirrors deletions off exactly that reading.
 func _collect_android() -> Array:
 	var out: Array = []
-	for m in Lock.list_media("all"):
-		if not (m is Dictionary):
-			continue
-		var name := str(m.get("display_name", ""))
-		var mime := str(m.get("mime_type", ""))
-		var bucket_name := str(m.get("bucket_name", "")).strip_edges()
-		var bucket_id := str(m.get("bucket_id", "")).strip_edges()
-		if bucket_id == "" or bucket_id == "0":
-			bucket_id = bucket_name if bucket_name != "" else ROOT_BUCKET
-		out.append({
-			"device": true,
-			"key": str(m.get("id", "")),
-			"bucket_id": bucket_id,
-			"bucket_name": bucket_name if bucket_name != "" else "未分类",
-			"uri": str(m.get("uri", "")),
-			"path": "",
-			"display_name": name,
-			"mime_type": mime,
-			"size": int(m.get("size", 0)),
-			"taken_at": int(m.get("taken_at", 0)),
-			"is_video": mime.begins_with("video"),
-			"width": int(m.get("width", 0)),
-			"height": int(m.get("height", 0)),
-			"duration_ms": int(m.get("duration_ms", 0)),
-		})
+	var complete := true
+	# Two collections, paged separately: one `_ID` cursor cannot span both, and a
+	# shared page budget would let a large photo library crowd out every video.
+	for media in ["image", "video"]:
+		var page_all := _collect_android_kind(media)
+		out.append_array(page_all["items"])
+		if not bool(page_all["complete"]):
+			complete = false
+	_scan_complete = complete
 	return out
+
+
+## One MediaStore collection, paged by ascending `_ID` until it comes back empty.
+## `complete` is false when paging stopped without reaching the end (the cursor
+## refused to advance), so a partial read is never reported as the whole gallery.
+func _collect_android_kind(media: String) -> Dictionary:
+	var out: Array = []
+	var cursor := 0
+	var complete := false
+	while true:
+		var page: Array = Lock.list_media(media, "" if cursor <= 0 else str(cursor))
+		if page.is_empty():
+			complete = true
+			break
+		var last := cursor
+		for m in page:
+			if not (m is Dictionary):
+				continue
+			last = maxi(last, int(m.get("id", 0)))
+			out.append(_android_item(m))
+		if last <= cursor:
+			break
+		cursor = last
+	return {"items": out, "complete": complete}
+
+
+## One MediaStore row as a device item.
+func _android_item(m: Dictionary) -> Dictionary:
+	var name := str(m.get("display_name", ""))
+	var mime := str(m.get("mime_type", ""))
+	var bucket_name := str(m.get("bucket_name", "")).strip_edges()
+	var bucket_id := str(m.get("bucket_id", "")).strip_edges()
+	if bucket_id == "" or bucket_id == "0":
+		bucket_id = bucket_name if bucket_name != "" else ROOT_BUCKET
+	return {
+		"device": true,
+		"key": str(m.get("id", "")),
+		"bucket_id": bucket_id,
+		"bucket_name": bucket_name if bucket_name != "" else "未分类",
+		"uri": str(m.get("uri", "")),
+		"path": "",
+		"display_name": name,
+		"mime_type": mime,
+		"size": int(m.get("size", 0)),
+		"taken_at": int(m.get("taken_at", 0)),
+		"is_video": mime.begins_with("video"),
+		"width": int(m.get("width", 0)),
+		"height": int(m.get("height", 0)),
+		"duration_ms": int(m.get("duration_ms", 0)),
+	}
 
 
 func _collect_pictures() -> Array:
@@ -335,7 +383,21 @@ func stop_worker() -> void:
 
 func _ensure_worker() -> void:
 	if _thread != null:
-		return
+		# The worker leaves as soon as its queue drains, and a job queued in that
+		# window would sit unprocessed until some later call happened to start a
+		# thread again (its thumbnail simply never appears). Reap the finished
+		# worker and start a fresh one instead.
+		var finished := false
+		if _mutex != null:
+			_mutex.lock()
+			finished = _thread_done
+			_mutex.unlock()
+		if not finished:
+			return
+		if _thread.is_started():
+			_thread.wait_to_finish()
+		_thread = null
+		_mutex = null
 	_mutex = Mutex.new()
 	_thread_done = false
 	_thread = Thread.new()
@@ -554,6 +616,39 @@ func local_video_path(item: Dictionary) -> String:
 	if not Lock.read_media_bytes(uri, ProjectSettings.globalize_path(dest)):
 		return ""
 	return dest
+
+
+## Evicts the regenerable device-side caches — thumbnails and device video
+## copies — oldest write first, until `wanted` bytes are free again; returns the
+## resulting free space. Both directories are pure caches: a thumbnail is decoded
+## again from the device (or from the file, on desktop) and a video copy re-read
+## from MediaStore, so nothing here is the only copy of anything. Ownership stays
+## with DeviceMedia (it created these directories and knows what they hold) while
+## the policy stays in Cache, which calls this once it has already dropped every
+## cloud original and is still short.
+func evict_cached_files(wanted: int) -> int:
+	var free := Cache.free_space_bytes()
+	var items: Array = []
+	for d in [THUMB_DIR, VIDEO_DIR]:
+		var dir := DirAccess.open(d)
+		if dir == null:
+			continue
+		dir.list_dir_begin()
+		var n := dir.get_next()
+		while n != "":
+			if not dir.current_is_dir():
+				var p: String = str(d) + "/" + str(n)
+				items.append({"path": p, "ts": int(FileAccess.get_modified_time(p))})
+			n = dir.get_next()
+		dir.list_dir_end()
+	items.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return int(a["ts"]) < int(b["ts"]))
+	for it in items:
+		if free >= wanted:
+			break
+		if DirAccess.remove_absolute(str(it["path"])) == OK:
+			free = Cache.free_space_bytes()
+	return free
 
 
 func remove_temp(user_path: String) -> void:

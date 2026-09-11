@@ -519,9 +519,14 @@ func (s *Store) DeleteAsset(ctx context.Context, id int64) (hash string, refsLef
 // deleteAssetRow hard-deletes one asset row and decrements its blob ref count,
 // deleting the blobs row when refs reach zero. It returns the affected blob
 // hash and the ref count remaining (0 means delete the physical blob).
+//
+// Only a recycle-bin row can be destroyed: this is the irrecoverable path, so a
+// live asset (deleted_at IS NULL) is refused rather than swept away by a
+// misdirected id — everything the user can still see deletes through
+// TrashAsset/RemoveOrTrash, which keep the 30-day window.
 func (s *Store) deleteAssetRow(ctx context.Context, tx *sql.Tx, id int64, at int64) (string, int, error) {
 	var h string
-	err := tx.QueryRowContext(ctx, `SELECT hash FROM assets WHERE id = ?`, id).Scan(&h)
+	err := tx.QueryRowContext(ctx, `SELECT hash FROM assets WHERE id = ? AND deleted_at IS NOT NULL`, id).Scan(&h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, ErrNotFound
 	}
@@ -860,7 +865,7 @@ func (s *Store) sourceAlbumTx(ctx context.Context, tx *sql.Tx, assetID int64) (t
 		return trashOrigin{}, err
 	}
 	if !found {
-		tid, err := s.trunkIDByNameTx(ctx, tx, "相册")
+		tid, err := s.trunkIDByNameTx(ctx, tx, trunkAlbumName)
 		if err != nil {
 			return trashOrigin{}, err
 		}
@@ -1253,8 +1258,11 @@ func (s *Store) MoveAlbum(ctx context.Context, id int64, parentID *int64) (*Albu
 	}
 
 	now := time.Now().Unix()
-	mergeQ := `SELECT id FROM albums WHERE parent_id IS NULL AND name = ? AND id <> ?`
-	mergeArgs := []any{src.Name, id}
+	// Root-level merges exclude the trunks: they are the library itself, so an
+	// album moved to the top level must never be folded into one — that would
+	// pour its photos into the trunk row and delete the album being moved.
+	mergeQ := `SELECT id FROM albums WHERE parent_id IS NULL AND name = ? AND id <> ? AND name NOT IN (?, ?)`
+	mergeArgs := []any{src.Name, id, trunkAlbumName, trunkPrivateName}
 	if parentID != nil {
 		mergeQ = `SELECT id FROM albums WHERE parent_id = ? AND name = ? AND id <> ?`
 		mergeArgs = []any{*parentID, src.Name, id}
@@ -1610,6 +1618,14 @@ func splitExt(name string) (string, string) {
 // rather than quietly un-starring it.
 const favoriteAlbumName = "收藏"
 
+// The two trunk roots. They are the library itself, not containers: nothing is
+// ever merged *into* one (see MoveAlbum), and an asset left with nowhere to go
+// is parked in the 相册 trunk's 散照.
+const (
+	trunkAlbumName   = "相册"
+	trunkPrivateName = "隐私"
+)
+
 // AlbumScopedDelete reports whether deleting a photo inside `albumID` should
 // remove only that album's reference (true) instead of the photo itself. Real
 // albums are containers the user files into; 收藏 and the trunk roots (全部 /
@@ -1767,6 +1783,71 @@ func (s *Store) RemoveOrPark(ctx context.Context, albumID, assetID int64) (bool,
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+// ParkAsset files an asset that belongs to no album into the 相册 trunk's 散照
+// bucket, creating the bucket when missing — the same landing spot the trash
+// provenance falls back to. An asset held by nobody appears in no listing (the
+// trunks aggregate their members) and is in no recycle bin either: a photo
+// nobody can see and nobody can restore. Every path that creates an asset is
+// supposed to end with it filed somewhere; this is the repair for the ones that
+// could not reach their intended album. Assets that already have a home are
+// left untouched, so it is safe to call unconditionally.
+func (s *Store) ParkAsset(ctx context.Context, assetID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var name string
+	var held int
+	err = tx.QueryRowContext(ctx, `
+		SELECT a.original_name,
+		       (SELECT COUNT(*) FROM album_assets aa WHERE aa.asset_id = a.id)
+		FROM assets a WHERE a.id = ? AND a.deleted_at IS NULL`, assetID).Scan(&name, &held)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if held > 0 {
+		return nil
+	}
+
+	trunkID, err := s.trunkIDByNameTx(ctx, tx, trunkAlbumName)
+	if err != nil {
+		return err
+	}
+	if trunkID == 0 {
+		return ErrNotFound
+	}
+	now := time.Now().Unix()
+	bucket, err := s.scatterBucketTx(ctx, tx, trunkID)
+	if err != nil {
+		return err
+	}
+	if bucket == 0 {
+		if bucket, err = s.childAlbumTx(ctx, tx, trunkID, "散照", now); err != nil {
+			return err
+		}
+	}
+	membershipName, err := membershipNameTx(ctx, tx, bucket, name, assetID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO album_assets (album_id, asset_id, added_at, name) VALUES (?, ?, ?, ?)`,
+		bucket, assetID, now, membershipName); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sync_log (entity, entity_id, op, at) VALUES ('album_asset', ?, 'create', ?)`,
+		assetID, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RemoveAssetFromAlbum(ctx context.Context, albumID, assetID int64) error {

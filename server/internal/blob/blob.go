@@ -153,13 +153,33 @@ func (s *Store) MigrateLegacyBlobs() error {
 	})
 }
 
+// maxImagePixels bounds what one image may decode to (≈200 MP, far past any
+// phone camera). The thumbnail pass decodes at full size to scale from, so an
+// image whose header claims absurd dimensions would otherwise be an allocation
+// the process cannot survive. Oversized images are still stored and served
+// byte-for-byte — they just do not get a thumbnail.
+const maxImagePixels = 200_000_000
+
 // EnsureThumb decodes r once and, when decodable, writes a max-512px JPEG
-// thumbnail. It returns ok=false for undecodable content (HEIC, video) with no
-// error, and true when a thumbnail exists or was just created.
-func (s *Store) EnsureThumb(hash string, r io.Reader) (bool, error) {
+// thumbnail. It returns ok=false for undecodable content (HEIC, video) and for
+// images past maxImagePixels, with no error, and true when a thumbnail exists or
+// was just created. r must be seekable: the header is read first and the stream
+// rewound for the decode.
+func (s *Store) EnsureThumb(hash string, r io.ReadSeeker) (bool, error) {
 	tp := s.thumbPath(hash)
 	if _, err := os.Stat(tp); err == nil {
 		return true, nil
+	}
+
+	cfg, _, err := image.DecodeConfig(r)
+	if err != nil {
+		return false, nil
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
+		return false, nil
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return false, err
 	}
 
 	img, _, err := image.Decode(r)

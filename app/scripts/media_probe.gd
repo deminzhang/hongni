@@ -16,6 +16,9 @@ const MOOV_READ_LIMIT := 32 * 1024 * 1024
 # EBML is walked sequentially from the start of the file; the metadata we need
 # (Info + Tracks) precedes the media Clusters, so a small budget always suffices.
 const EBML_READ_BUDGET := 16 * 1024 * 1024
+# Master elements nest, and a crafted file can nest them without end: the byte
+# budget alone would allow millions of levels of recursion before it runs out.
+const EBML_MAX_DEPTH := 16
 
 # EBML element ids, marker bits included (the values _read_vint returns).
 const EBML_SEGMENT := 0x18538067
@@ -203,8 +206,12 @@ static func _probe_matroska(path: String, out: Dictionary) -> void:
 
 
 ## Walks EBML elements within [position, end], descending into the master
-## elements that carry our targets and skipping everything else by size.
-static func _walk_ebml(f: FileAccess, end: int, state: Dictionary, budget: Array) -> void:
+## elements that carry our targets and skipping everything else by size. `depth`
+## bounds that descent: nesting is attacker-controlled, so it must not be able to
+## recurse until the stack runs out.
+static func _walk_ebml(f: FileAccess, end: int, state: Dictionary, budget: Array, depth: int = 0) -> void:
+	if depth > EBML_MAX_DEPTH:
+		return
 	while budget[0] > 0 and f.get_position() < end and not f.eof_reached():
 		var id_r := _read_vint(f)
 		if id_r.is_empty():
@@ -220,7 +227,7 @@ static func _walk_ebml(f: FileAccess, end: int, state: Dictionary, budget: Array
 		var body_end := end if size == mask else mini(body + size, end)
 		match id:
 			EBML_SEGMENT, EBML_INFO, EBML_TRACKS, EBML_TRACK_ENTRY, EBML_VIDEO:
-				_walk_ebml(f, body_end, state, budget)
+				_walk_ebml(f, body_end, state, budget, depth + 1)
 				if size == mask:
 					# Unknown-length master: it owns the rest of the parent.
 					return
