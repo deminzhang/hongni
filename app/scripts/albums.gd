@@ -30,8 +30,12 @@ const ASSET_MENU := preload("res://scripts/asset_menu.gd")
 const VIDEO := "视频"
 const VIDEO_FILTER := "videos"
 const TRUNK_COLUMNS := 2
-# Card is just the preview icon (mostly) plus a single-line name label.
-const CARD_SIZE := Vector2(336, 322)
+# Card is just the preview icon (mostly) plus a single-line name label. Width is
+# what caps this: 2 columns + the 16px h_separation must fit the 600px base
+# viewport (592 of 600).
+const CARD_SIZE := Vector2(288, 276)
+# Top-bar icon buttons (+ / ⋮): square touch targets sized like 返回.
+const TOP_BTN_SIZE := Vector2(72, 72)
 
 enum MenuId { RENAME, DELETE_ALBUM, MOVE_ALBUM, COPY_ALBUM }
 enum MoreId { TRASH, SYNC, SETTINGS }
@@ -135,7 +139,8 @@ func _build_ui() -> void:
 	btn_new = Button.new()
 	btn_new.text = "+"
 	btn_new.focus_mode = Control.FOCUS_NONE
-	btn_new.custom_minimum_size = Vector2(44, 44)
+	btn_new.custom_minimum_size = TOP_BTN_SIZE
+	btn_new.add_theme_font_size_override("font_size", 24)
 	btn_new.pressed.connect(_new_album)
 	top.add_child(btn_new)
 
@@ -143,7 +148,8 @@ func _build_ui() -> void:
 	var more_btn := Button.new()
 	more_btn.text = "⋮"
 	more_btn.focus_mode = Control.FOCUS_NONE
-	more_btn.custom_minimum_size = Vector2(44, 44)
+	more_btn.custom_minimum_size = TOP_BTN_SIZE
+	more_btn.add_theme_font_size_override("font_size", 24)
 	more_btn.pressed.connect(_show_more_menu)
 	top.add_child(more_btn)
 

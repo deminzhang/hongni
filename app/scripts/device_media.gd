@@ -307,8 +307,26 @@ func cover_item(list: Array) -> Dictionary:
 
 # --- Thumbnails --------------------------------------------------------------
 
+## Real pixels per logical UI unit. The project stretches 2D content to the
+## screen (`canvas_items`), so a grid cell that is THUMB_SIZE units wide covers
+## more than THUMB_SIZE real pixels on a phone (1080px wide screen / 720 units =
+## 1.5x). Thumbnails are decoded at the size they are actually shown at, so the
+## grid never upscales a small render.
+func display_scale() -> float:
+	var win := DisplayServer.window_get_size()
+	var logical := get_viewport().get_visible_rect().size
+	if win.x <= 0 or logical.x <= 0.0:
+		return 1.0
+	return maxf(1.0, float(win.x) / logical.x)
+
+
+## The pixel size a thumbnail asked for in logical units is decoded at.
+func thumb_px(size: int) -> int:
+	return maxi(1, int(round(float(size) * display_scale())))
+
+
 func thumb_path(item: Dictionary, size: int) -> String:
-	return THUMB_DIR + "/" + key_of(item).md5_text() + "_%d.png" % size
+	return THUMB_DIR + "/" + key_of(item).md5_text() + "_%d.png" % thumb_px(size)
 
 
 func preview_path(item: Dictionary, max_px: int) -> String:
@@ -331,7 +349,7 @@ func queue_thumb(item: Dictionary, size: int) -> void:
 		return
 	_ensure_worker()
 	_mutex.lock()
-	_jobs.append({"key": key_of(item), "path": str(item.get("path", "")), "size": size, "cache": cache})
+	_jobs.append({"key": key_of(item), "path": str(item.get("path", "")), "size": thumb_px(size), "cache": cache})
 	_mutex.unlock()
 
 
@@ -342,7 +360,7 @@ func decode_thumb_now(item: Dictionary, size: int) -> Image:
 	var cached := _load_image(cache)
 	if cached.get_width() > 0:
 		return cached
-	if not Lock.load_thumbnail(str(item.get("uri", "")), ProjectSettings.globalize_path(cache), size):
+	if not Lock.load_thumbnail(str(item.get("uri", "")), ProjectSettings.globalize_path(cache), thumb_px(size)):
 		return Image.new()
 	return _load_image(cache)
 

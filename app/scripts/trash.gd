@@ -6,6 +6,8 @@ extends Control
 ## recorded at delete time).
 
 const THUMB_SIZE := 140
+# Touch height of the top-bar 返回 (~48dp once the 600px base is scaled up).
+const BACK_BTN_H := 72
 const RENDER_CHUNK := 150
 
 enum MenuId { RESTORE, DELETE_FOREVER }
@@ -44,6 +46,8 @@ func _build_ui() -> void:
 
 	var btn_back := Button.new()
 	btn_back.text = "← 返回"
+	btn_back.custom_minimum_size = Vector2(0, BACK_BTN_H)
+	btn_back.add_theme_font_size_override("font_size", 20)
 	btn_back.pressed.connect(_go_back)
 	top.add_child(btn_back)
 

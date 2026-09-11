@@ -14,6 +14,8 @@ extends Control
 const ASSET_MENU := preload("res://scripts/asset_menu.gd")
 
 const THUMB_SIZE := 140
+# Touch height of the top-bar 返回 (~48dp once the 600px base is scaled up).
+const BACK_BTN_H := 72
 const LONG_PRESS := 0.5
 const RENDER_CHUNK := 150
 # Device thumbnails per frame on Android: the plugin decodes on the calling
@@ -103,6 +105,8 @@ func _build_ui() -> void:
 
 	var btn_back := Button.new()
 	btn_back.text = "← 返回"
+	btn_back.custom_minimum_size = Vector2(0, BACK_BTN_H)
+	btn_back.add_theme_font_size_override("font_size", 20)
 	btn_back.pressed.connect(_go_back)
 	top.add_child(btn_back)
 

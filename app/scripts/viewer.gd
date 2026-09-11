@@ -19,6 +19,8 @@ extends Control
 ## 详细 (删除/存到相册 belong to the cloud and stay hidden).
 
 const SWIPE_THRESHOLD := 80.0
+# Touch height of the top-bar 返回 (~48dp once the 600px base is scaled up).
+const BACK_BTN_H := 72
 # In-app MediaPlayer frames are captured at this size and scaled to fit. Lower
 # resolution keeps the per-frame getBitmap() readback light so playback stays
 # smooth; it scales up to the video area on screen.
@@ -128,6 +130,8 @@ func _build_ui() -> void:
 
 	var btn_back := Button.new()
 	btn_back.text = "← 返回"
+	btn_back.custom_minimum_size = Vector2(0, BACK_BTN_H)
+	btn_back.add_theme_font_size_override("font_size", 20)
 	btn_back.pressed.connect(_go_back)
 	top_bar.add_child(btn_back)
 

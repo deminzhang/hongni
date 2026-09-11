@@ -5,6 +5,10 @@ extends Control
 
 enum NodeStatus { UNKNOWN, OK, FAIL }
 
+# Touch height of the top-bar 返回: at the stretch scale (screen width / 600) this
+# lands at ~48dp on a phone, the Android minimum for a finger target.
+const BACK_BTN_H := 72
+
 const DOT_COLOR := {
 	NodeStatus.UNKNOWN: Color(0.62, 0.62, 0.64),
 	NodeStatus.OK: Color(0.21, 0.78, 0.35),
@@ -56,13 +60,15 @@ func _build_ui() -> void:
 	v.add_child(top)
 
 	var btn_back := Button.new()
-	btn_back.text = "← 返回"
+	btn_back.text = "< <"
+	btn_back.custom_minimum_size = Vector2(0, BACK_BTN_H)
+	btn_back.add_theme_font_size_override("font_size", 20)
 	btn_back.focus_mode = Control.FOCUS_NONE
 	btn_back.pressed.connect(_go_back)
 	top.add_child(btn_back)
 
 	var title := Label.new()
-	title.text = "红泥 · 设置"
+	title.text = "设置"
 	title.add_theme_font_size_override("font_size", 28)
 	title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	top.add_child(title)
