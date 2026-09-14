@@ -1,14 +1,15 @@
 extends Control
 ## Album browser: three parallel trunks — 系统相册 (this device's own gallery, the
-## one the app opens on), 红泥相册 (the cloud backup) and 红泥隐私相册 (cloud,
-## hidden) — switched with the top-bar tabs. Each trunk shows the same
+## one the app opens on), 共享相册 (the cloud, shared by the whole family) and
+## 隐私相册 (cloud, this identity's own, hidden) — switched with the top-bar tabs.
+## Each trunk shows the same
 ## multi-column card grid (收藏 / 全部 / 视频 / sub-albums in the cloud trunks,
 ## 全部 / 视频 / one card per device album in the system trunk); selecting a card
 ## opens album_view.tscn, the one photo grid all three share.
 ##
 ## 系统相册 is the browsing surface: the device keeps its own storage, its own
 ## app still works without hongni, and the cloud shows up as the ☁ 已备份 state
-## on each item plus an album mirroring each device album. 红泥相册 is where the
+## on each item plus an album mirroring each device album. 共享相册 is where the
 ## cloud side is managed (albums, favourites, recycle bin).
 ##
 ## The 散照 bucket is retained in the data layer only: it is folded into the
@@ -36,6 +37,9 @@ const TRUNK_COLUMNS := 2
 const CARD_SIZE := Vector2(288, 276)
 # Top-bar icon buttons (+ / ⋮): square touch targets sized like 返回.
 const TOP_BTN_SIZE := Vector2(72, 72)
+# Device card covers decoded per frame on Android (the plugin bridge decodes on
+# the calling thread, so the first frame must not carry every card at once).
+const DEVICE_THUMB_PER_FRAME := 2
 
 enum MenuId { RENAME, DELETE_ALBUM, MOVE_ALBUM, COPY_ALBUM }
 enum MoreId { TRASH, SYNC, SETTINGS }
@@ -62,6 +66,9 @@ var _offline := false
 # Device card (系统相册 trunk) previews still decoding on DeviceMedia's worker:
 # device item key -> the card button waiting for that thumbnail.
 var _device_cards: Dictionary = {}
+# Device covers still waiting for their Android decode (one per card), drained
+# at DEVICE_THUMB_PER_FRAME per frame.
+var _thumb_queue: Array = []
 
 # Long-press state. _lp_suppress swallows the 'pressed' signal that fires on
 # release after a long-press, so the short-click action doesn't also run.
@@ -79,13 +86,13 @@ var _ctx_device_bucket := ""
 func _ready() -> void:
 	# The active trunk survives the scene switches into album_view / viewer /
 	# trash / 设置 — they all come back here — so 返回 lands where the user left
-	# off instead of always resetting to 红泥相册.
+	# off instead of always resetting to 共享相册.
 	current_trunk = _restore_trunk()
 	_build_ui()
 	_sync_trunk_state()
 	Cache.enforce_cache()
 	_reload_context.call_deferred()
-	# 红泥相册 / 隐私相册 keep themselves current: entering the album browser pulls
+	# 共享相册 / 隐私相册 keep themselves current: entering the album browser pulls
 	# the cloud side (remote changes, queued deletes). The device gallery is only
 	# backed up when the user asks for it — 立即同步.
 	if Store.is_configured():
@@ -106,10 +113,17 @@ func _restore_trunk() -> String:
 
 func _process(_dt: float) -> void:
 	# Card previews decoded on DeviceMedia's background worker (desktop).
-	if _device_cards.is_empty():
-		return
 	for r in DeviceMedia.poll_thumbs():
 		_apply_device_card_thumb(str(r["key"]), r["image"])
+	# Android has no worker (the plugin bridge is main-thread only), so each
+	# card's cover is decoded here, a couple per frame.
+	var budget := DEVICE_THUMB_PER_FRAME
+	while budget > 0 and not _thumb_queue.is_empty():
+		var cover: Dictionary = _thumb_queue.pop_front()
+		var key := DeviceMedia.key_of(cover)
+		if _device_cards.has(key):
+			_apply_device_card_thumb(key, DeviceMedia.decode_thumb_now(cover, int(CARD_SIZE.x)))
+		budget -= 1
 
 
 func _build_ui() -> void:
@@ -122,7 +136,7 @@ func _build_ui() -> void:
 	root.add_child(top)
 
 	var trunk_group := ButtonGroup.new()
-	btn_trunk_album = _make_trunk_button(Api.TRUNK_CLOUD, "红泥相册", trunk_group)
+	btn_trunk_album = _make_trunk_button(Api.TRUNK_CLOUD, "共享相册", trunk_group)
 	btn_trunk_system = _make_trunk_button(TRUNK_SYSTEM, "系统相册", trunk_group)
 	btn_trunk_private = _make_trunk_button(Api.TRUNK_PRIVATE, "隐私相册", trunk_group)
 	top.add_child(btn_trunk_album)
@@ -293,6 +307,7 @@ func _reload_context() -> void:
 	for c in card_grid.get_children():
 		c.queue_free()
 	_device_cards.clear()
+	_thumb_queue.clear()
 	if current_trunk == TRUNK_SYSTEM:
 		Api.current_trunk = TRUNK_SYSTEM
 		Api.current_trunk_id = 0
@@ -338,7 +353,7 @@ func _reload_context() -> void:
 		else:
 			subs.append(a)
 
-	# Device-gallery uploads always land in 红泥相册 (its 散照 bucket), whichever
+	# Device-gallery uploads always land in 共享相册 (its 散照 bucket), whichever
 	# trunk is currently on screen; remember it while we have the list at hand.
 	if current_trunk == Api.TRUNK_CLOUD:
 		Api.import_album_id = Api.scatter_album_id
@@ -492,6 +507,8 @@ func _add_device_card(bucket_id: String, name: String, count: int, cover, album_
 	var img := DeviceMedia.cached_thumb(cover, int(CARD_SIZE.x))
 	if img.get_width() > 0:
 		_apply_device_card_thumb(key, img)
+	elif DeviceMedia.decodes_in_caller():
+		_thumb_queue.append(cover)
 	else:
 		DeviceMedia.queue_thumb(cover, int(CARD_SIZE.x))
 
@@ -545,7 +562,7 @@ func _show_album_menu(album_id: int, album_name: String) -> void:
 
 
 ## Menu for a device album (系统相册). The device owns the album and its files, so
-## the only actions are pushing them into a cloud trunk: 移动到 红泥相册/隐私相册,
+## the only actions are pushing them into a cloud trunk: 移动到 共享相册/隐私相册,
 ## or 复制到 (which leaves the device's own files in place).
 func _show_device_album_menu(bucket_id: String, album_name: String) -> void:
 	if bucket_id == "" or bucket_id == DeviceMedia.ALL_BUCKET or bucket_id == DeviceMedia.VIDEO_BUCKET:
@@ -619,11 +636,11 @@ func _prompt_album_target(title: String, device_source: bool, on_pick: Callable)
 
 
 ## How a trunk is offered as a destination: a device album keeps its own
-## grouping in 红泥相册 (one cloud album per device album) but has no counterpart
+## grouping in 共享相册 (one cloud album per device album) but has no counterpart
 ## in 隐私相册, where everything lands in 散照.
 func _target_label(trunk: String, device_source: bool) -> String:
 	if trunk == Api.TRUNK_CLOUD:
-		return "红泥相册（按本机相册归位）" if device_source else "红泥相册"
+		return "共享相册（按本机相册归位）" if device_source else "共享相册"
 	return "隐私相册（散照）" if device_source else "隐私相册"
 
 
@@ -750,7 +767,7 @@ func _upload_device_album(bucket_id: String, album_name: String, move: bool, tar
 	if items.is_empty():
 		_set_status_notice("「%s」没有可上传的项目" % album_name)
 		return
-	# 红泥相册 keeps the device album's own grouping (a cloud album per device
+	# 共享相册 keeps the device album's own grouping (a cloud album per device
 	# album); 隐私相册 has no counterpart, so its files land in that trunk's 散照.
 	var album_id := 0
 	if int(target["kind"]) == TargetId.CLOUD:

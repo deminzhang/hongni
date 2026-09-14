@@ -1,7 +1,7 @@
 extends Control
 ## Settings scene: server node list (one row per node, priority = row order,
-## per-node sub-UI for name/address/token/test/delete), local storage policy,
-## parent PIN.
+## per-node sub-UI for name/address/token/身份 ID/PIN/login test/delete), local
+## storage policy.
 
 enum NodeStatus { UNKNOWN, OK, FAIL }
 
@@ -15,8 +15,10 @@ const DOT_COLOR := {
 	NodeStatus.FAIL: Color(1.0, 0.23, 0.19),
 }
 
-var pin_edit: LineEdit
-var pin_status: Label
+## Emitted once by the 修改 PIN dialog with (current, new); both empty when the
+## dialog was dismissed.
+signal _pin_change_submitted(current: String, fresh: String)
+
 var chk_clean: CheckButton
 var spin_free: SpinBox
 var storage_status: Label
@@ -35,8 +37,11 @@ var _edit_index: int = -1
 var _f_name: LineEdit
 var _f_url: LineEdit
 var _f_token: LineEdit
+var _f_identity: LineEdit
+var _f_pin: LineEdit
 var _edit_status: Label
 var _btn_delete: Button
+var _btn_pin: Button
 
 
 func _ready() -> void:
@@ -79,7 +84,7 @@ func _build_ui() -> void:
 	v.add_child(hdr_srv)
 
 	var hint := Label.new()
-	hint.text = "按由上到下的优先级尝试，第一个连得上的结点生效；上一个可用的结点会被优先复用。"
+	hint.text = "按由上到下的优先级尝试，第一个连得上的结点生效；上一个可用的结点会被优先复用。\n每台设备用「身份 ID + PIN」登录：共享相册全家可见可操作，隐私相册只有本人能看到。身份 ID 首次注册为准，PIN 在首次注册时设定。"
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	v.add_child(hint)
 
@@ -143,25 +148,6 @@ func _build_ui() -> void:
 	storage_status = Label.new()
 	storage_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	v.add_child(storage_status)
-
-	# --- Parent PIN section ---
-	var hdr_pin := Label.new()
-	hdr_pin.text = "家长 PIN"
-	v.add_child(hdr_pin)
-
-	var pin_row := HBoxContainer.new()
-	v.add_child(pin_row)
-	pin_edit = LineEdit.new()
-	pin_edit.placeholder_text = "4–6 位数字 PIN"
-	pin_edit.secret = true
-	pin_edit.max_length = 6
-	pin_row.add_child(pin_edit)
-	var btn_pin := Button.new()
-	btn_pin.text = "设置 PIN"
-	btn_pin.pressed.connect(_set_pin)
-	pin_row.add_child(btn_pin)
-	pin_status = Label.new()
-	v.add_child(pin_status)
 
 	_build_node_editor()
 	if not Lock.lan_result.is_connected(_on_lan_result):
@@ -339,6 +325,21 @@ func _build_node_editor() -> void:
 	_f_token.secret = true
 	col.add_child(_f_token)
 
+	var l_identity := Label.new()
+	l_identity.text = "身份 ID"
+	col.add_child(l_identity)
+	_f_identity = LineEdit.new()
+	_f_identity.placeholder_text = "如：爸爸 / baba"
+	col.add_child(_f_identity)
+
+	var l_pin := Label.new()
+	l_pin.text = "PIN (4–6 位数字)"
+	col.add_child(l_pin)
+	_f_pin = LineEdit.new()
+	_f_pin.secret = true
+	_f_pin.max_length = 6
+	col.add_child(_f_pin)
+
 	_edit_status = Label.new()
 	_edit_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	col.add_child(_edit_status)
@@ -346,9 +347,13 @@ func _build_node_editor() -> void:
 	var actions := HBoxContainer.new()
 	col.add_child(actions)
 	var btn_test := Button.new()
-	btn_test.text = "连接测试"
+	btn_test.text = "登录测试"
 	btn_test.pressed.connect(_test_node)
 	actions.add_child(btn_test)
+	_btn_pin = Button.new()
+	_btn_pin.text = "修改 PIN"
+	_btn_pin.pressed.connect(_change_pin)
+	actions.add_child(_btn_pin)
 	_btn_delete = Button.new()
 	_btn_delete.text = "删除"
 	_btn_delete.pressed.connect(_delete_node)
@@ -372,8 +377,13 @@ func _open_node_editor(index: int) -> void:
 	_f_name.text = str(node.get("name", ""))
 	_f_url.text = str(node.get("url", ""))
 	_f_token.text = str(node.get("token", ""))
+	_f_identity.text = str(node.get("identity", ""))
+	_f_pin.text = str(node.get("pin", ""))
 	_editor_title.text = "编辑结点" if index >= 0 else "添加结点"
 	_btn_delete.visible = index >= 0
+	# 换 PIN 是服务器上的动作：只对当前生效的那个结点有意义（请求带的会话就是它
+	# 的），所以编辑别的结点时不出现。
+	_btn_pin.visible = index >= 0 and index == Store.active_server and str(node.get("identity", "")) != ""
 	_edit_status.text = ""
 	_editor_layer.visible = true
 
@@ -387,13 +397,28 @@ func _save_node() -> void:
 	if _f_url.text.strip_edges() == "":
 		_edit_status.text = "请填写地址"
 		return
-	var entry := {"name": _f_name.text, "url": _f_url.text, "token": _f_token.text}
 	var list := Store.servers()
+	var identity := _f_identity.text.strip_edges()
+	# identity_id 只在与旧条目同服务器、同身份时沿用。换了任何一个，记住的那个 id
+	# 都属于别人的隐私相册；置 0 让下一次登录必定走一次身份切换清理。
+	var same := _edit_index >= 0 and _edit_index < list.size() \
+			and str(list[_edit_index].get("identity", "")) == identity \
+			and str(list[_edit_index].get("url", "")) == _f_url.text.strip_edges().trim_suffix("/")
+	var entry := {
+		"name": _f_name.text,
+		"url": _f_url.text,
+		"token": _f_token.text,
+		"identity": identity,
+		"pin": _f_pin.text.strip_edges(),
+		"identity_id": int(list[_edit_index].get("identity_id", 0)) if same else 0,
+	}
 	if _edit_index >= 0 and _edit_index < list.size():
 		list[_edit_index] = entry
 	else:
 		list.append(entry)
 	Store.set_servers(list)
+	# 存的结点可能带着另一个身份或另一个 PIN，手里活着的会话不再代表它。
+	Api.clear_sessions()
 	_close_node_editor()
 	_rebuild_nodes()
 	await _refresh_connectivity()
@@ -410,24 +435,74 @@ func _delete_node() -> void:
 	await _refresh_connectivity()
 
 
-## Tests the values as typed, before saving; the row dot follows the outcome.
+## Logs in with the values as typed, before saving: this both validates the
+## token/address and registers the 身份 ID on first use, so the user learns here
+## whether they are setting a PIN or proving it. The row dot follows the outcome.
 func _test_node() -> void:
 	var url := _f_url.text.strip_edges()
 	if url == "":
 		_edit_status.text = "请填写地址"
 		return
-	_edit_status.text = "测试中…"
+	_edit_status.text = "登录中…"
 	_set_row_status(_edit_index, NodeStatus.UNKNOWN)
-	var r: Dictionary = await Api.test_node(url, _f_token.text)
+	var r: Dictionary = await Api.login_node(url, _f_token.text, _f_identity.text, _f_pin.text)
 	if r.has("error"):
-		# The transport errors already read "连接失败（网络错误 N）"; only the
-		# 401 needs translating for a human.
-		var msg := str(r.get("error", ""))
-		_edit_status.text = "令牌无效" if int(r.get("status", 0)) == 401 else msg
+		_edit_status.text = str(r.get("error", "登录失败"))
 		_set_row_status(_edit_index, NodeStatus.FAIL)
 	else:
-		_edit_status.text = "已连接 ✓"
+		var data: Dictionary = r.get("data", {}) if r.get("data") is Dictionary else {}
+		var ident: Dictionary = data.get("identity", {}) if data.get("identity") is Dictionary else {}
+		var who := str(ident.get("name", _f_identity.text.strip_edges()))
+		if bool(data.get("registered", false)):
+			_edit_status.text = "已注册并登录：%s（首次注册已设定 PIN）" % who
+		else:
+			_edit_status.text = "已登录：%s" % who
 		_set_row_status(_edit_index, NodeStatus.OK)
+
+
+## 换 PIN：服务器先认旧 PIN，认过之后该身份的所有旧会话作废。本地记录跟着更新，
+## 否则下一次自动重登会用旧 PIN 把自己挡在门外。
+func _change_pin() -> void:
+	if _edit_index < 0:
+		return
+	var scene := get_tree().current_scene
+	if scene == null:
+		return
+	var dialog := AcceptDialog.new()
+	dialog.title = "修改 PIN"
+	dialog.dialog_text = "服务器会先校验当前 PIN，改完本设备的记录一并更新。"
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 8)
+	var cur := LineEdit.new()
+	cur.secret = true
+	cur.max_length = 6
+	cur.placeholder_text = "当前 PIN"
+	box.add_child(cur)
+	var fresh := LineEdit.new()
+	fresh.secret = true
+	fresh.max_length = 6
+	fresh.placeholder_text = "新 PIN（4–6 位数字）"
+	box.add_child(fresh)
+	dialog.add_child(box)
+	scene.add_child(dialog)
+	dialog.confirmed.connect(func() -> void: _pin_change_submitted.emit(cur.text, fresh.text))
+	dialog.canceled.connect(func() -> void: _pin_change_submitted.emit("", ""))
+	dialog.popup_centered()
+	var pair: Array = await _pin_change_submitted
+	if is_instance_valid(dialog):
+		dialog.queue_free()
+	var new_pin := str(pair[1]) if pair.size() > 1 else ""
+	if new_pin == "":
+		return
+	_edit_status.text = "修改中…"
+	var r: Dictionary = await Api.set_identity_pin(str(pair[0]), new_pin)
+	if r.has("error"):
+		_edit_status.text = str(r.get("error", "修改失败"))
+		return
+	Store.set_server_pin(_edit_index, new_pin.strip_edges())
+	_f_pin.text = new_pin.strip_edges()
+	_edit_status.text = "PIN 已更新"
+	_set_row_status(_edit_index, NodeStatus.OK)
 
 
 func _scan_lan() -> void:
@@ -443,28 +518,6 @@ func _on_lan_result(addresses: Array) -> void:
 	else:
 		_f_url.text = addresses[0]
 		_edit_status.text = "发现服务，已填入地址（仍需确认令牌）"
-
-
-# --- Parent PIN --------------------------------------------------------------
-
-## 设置父母 PIN。设置页入口本身不再受 PIN 保护，所以“换 PIN”必须在这里先
-## 证明知道旧 PIN，否则谁都能进来把锁换掉。
-func _set_pin() -> void:
-	var pin := pin_edit.text.strip_edges()
-	if not pin.is_valid_int() or pin.length() < 4 or pin.length() > 6:
-		pin_status.text = "PIN 需为 4–6 位数字"
-		return
-	var was_set := Lock.has_pin_set()
-	if not await Lock.require_current_pin():
-		pin_status.text = "未修改 PIN：当前 PIN 校验未通过"
-		return
-	var salt := Lock.random_salt()
-	var hash := Lock.hash_pin(pin, salt)
-	Store.settings["master_pin_hash"] = hash
-	Store.settings["master_pin_salt"] = salt
-	Store.save_settings()
-	pin_edit.text = ""
-	pin_status.text = "家长 PIN 已更新" if was_set else "家长 PIN 已设置"
 
 
 # --- Local storage / auto-clean ----------------------------------------------

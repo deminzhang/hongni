@@ -24,7 +24,7 @@ enum MenuId { FAV_TOGGLE, MOVE, COPY, SET_COVER, RENAME, DELETE, DETAILS, KEEP, 
 ## Where a 移动到/复制到 can send one asset:
 ##   ALBUM   a real sub-album under one of the trunks,
 ##   TRUNK   a cloud trunk as a whole — a single file lands in its 散照 (a device
-##           item going to 红泥 lands in the album mirroring its device album,
+##           item going to 共享相册 lands in the album mirroring its device album,
 ##           so the grouping the system gallery shows is the one the cloud keeps),
 ##   DEVICE  the device gallery itself, written as an export into Pictures/红泥.
 enum TargetKind { ALBUM, TRUNK, DEVICE }
@@ -392,13 +392,13 @@ func _prompt_album(title: String, pick: int, on_confirm: Callable) -> void:
 
 
 ## The two cloud trunks as destinations. A single file dropped on a trunk lands
-## in that trunk's 散照; a device item going to 红泥 keeps its device album
+## in that trunk's 散照; a device item going to 共享相册 keeps its device album
 ## grouping instead (a separate album per device album).
 func _trunk_options(device_source: bool) -> Array:
 	var out: Array = [{
 		"kind": TargetKind.TRUNK,
 		"trunk": Api.TRUNK_CLOUD,
-		"label": "红泥相册" + ("（按本机相册归位）" if device_source else "（散照）"),
+		"label": "共享相册" + ("（按本机相册归位）" if device_source else "（散照）"),
 	}, {
 		"kind": TargetKind.TRUNK,
 		"trunk": Api.TRUNK_PRIVATE,
@@ -483,6 +483,7 @@ func _apply_move_copy(target: Dictionary, move: bool) -> void:
 	var ids: Array = []
 	var pushed: Array = []
 	var failed := 0
+	var detached := 0
 
 	# Uploads write a sync-index entry each; one write for the whole selection.
 	Store.begin_batch()
@@ -517,12 +518,22 @@ func _apply_move_copy(target: Dictionary, move: bool) -> void:
 			else:
 				failed += 1
 			continue
+		# 移动到隐私相册 = 只自己可见：服务端连这张照片在共享相册里的引用一起摘掉，
+		# 所以来源相册那一步（_attach 里的摘除）由服务端代劳。复制则原样保留共享引用
+		# ——要移开的话由用户自己删。
+		var only_here := move and kind == TargetKind.TRUNK and trunk == Api.TRUNK_PRIVATE
 		var album_id := _as_int(target.get("id")) if kind == TargetKind.ALBUM \
 			else await Api.resolve_scatter_album(trunk)
-		if album_id > 0 and await _attach(asset_id, album_id, move):
-			ids.append(asset_id)
-		else:
+		var res: Dictionary = {}
+		if album_id > 0:
+			res = await _attach(asset_id, album_id, move, only_here)
+		if res.is_empty():
 			failed += 1
+		else:
+			ids.append(asset_id)
+			var data = res.get("data")
+			if only_here and data is Dictionary and _as_int(data.get("detached_shared")) > 0:
+				detached += 1
 	Store.end_batch()
 
 	# 移动 out of the device gallery only deletes the device's own file once the
@@ -539,21 +550,26 @@ func _apply_move_copy(target: Dictionary, move: bool) -> void:
 		text += "（%d 项失败）" % failed
 	if device_source and move and pushed.size() > moved_out:
 		text += "；本机文件未删除 %d 项" % (pushed.size() - moved_out)
+	if detached > 0:
+		text += "；已移除其它相册的引用"
 	notice.emit(text)
 	changed.emit(ids, "device" if device_source else ("move" if move else "copy"))
 
 
 ## Adds `asset_id` to `album_id`, and detaches it from the album being viewed
-## when this is a 移动. Returns false only when the destination could not be set.
-func _attach(asset_id: int, album_id: int, move: bool) -> bool:
-	var r: Dictionary = await Api.add_asset_to_album(album_id, asset_id)
+## when this is a 移动. With `only_here` the server has already taken the photo
+## out of every shared album — 转到隐私相册 means the family stops seeing it — so
+## that detach is skipped rather than repeated. Returns the server response
+## ({} when the destination could not be set).
+func _attach(asset_id: int, album_id: int, move: bool, only_here: bool) -> Dictionary:
+	var r: Dictionary = await Api.add_asset_to_album(album_id, asset_id, only_here)
 	if r.has("error"):
-		return false
-	if move:
+		return {}
+	if move and not only_here:
 		var src := _as_int(_source_album.call()) if _source_album.is_valid() else 0
 		if src > 0 and src != album_id:
 			await Api.remove_asset_from_album(src, asset_id)
-	return true
+	return r
 
 
 # --- cloud -> device ---------------------------------------------------------

@@ -28,8 +28,9 @@ var current_trunk: String = "系统相册"
 var current_trunk_id: int = 0
 var favorite_album_id: int = 0
 var scatter_album_id: int = 0
-# The 散照 bucket of the 相册 (cloud) trunk: where device-gallery uploads land,
-# regardless of which trunk is on screen (the private trunk has its own 散照).
+# The 散照 bucket of the 共享相册 (cloud) trunk: where device-gallery uploads
+# land, regardless of which trunk is on screen (the private trunk has its own
+# 散照).
 var import_album_id: int = 0
 
 
@@ -62,17 +63,27 @@ const SCRATCH_BUCKETS := ["散照", "未分类散照"]
 ## Names that already mean something inside a trunk: a device album called 收藏
 ## must not be mirrored onto the favourites bucket, nor a device album called
 ## 散照 collide with the scratch bucket.
-const RESERVED_ALBUM_NAMES := ["相册", "隐私", "收藏", "散照", "未分类散照"]
+const RESERVED_ALBUM_NAMES := ["共享相册", "隐私", "收藏", "散照", "未分类散照"]
 ## The two cloud trunks, by their server-side top-level album name. These are
 ## wire values: the client's tab identifiers and the server's rows must agree,
-## so they are defined once, here.
-const TRUNK_CLOUD := "相册"
+## so they are defined once, here. 共享相册 is everyone's; 隐私 is the logged-in
+## identity's own.
+const TRUNK_CLOUD := "共享相册"
 const TRUNK_PRIVATE := "隐私"
+## Where 身份 ID + PIN are exchanged for a session token.
+const LOGIN_PATH := "/identity/login"
 ## Device album name -> cloud album id, so an upload from a device album resolves
 ## its target once instead of re-listing the albums for every photo.
 var _device_albums: Dictionary = {}
 ## Trunk name -> its 散照 bucket id, resolved once per run.
 var _trunk_scatter: Dictionary = {}
+## Node url -> {"session": String, "identity_id": int, "identity": String}. The
+## session is the server's proof of who this device is; without it every data
+## route answers 401.
+var _sessions: Dictionary = {}
+## Node url -> true while a login for it is in flight, so concurrent requests do
+## not each log in once.
+var _login_pending: Dictionary = {}
 
 
 ## Sends a request to the server, walking the node list on transport failure:
@@ -92,13 +103,165 @@ func _do_request_slot_held(method: int, path: String, body: String, extra_header
 	if nodes.is_empty():
 		return {"error": "未配置服务器", "status": 0}
 	var failure: Dictionary = {"error": "所有服务器结点均不可达", "status": 0}
+	var loginError: Dictionary = {}
+	var loginIdx := 0
 	for idx in _node_order(nodes.size()):
+		var login: Dictionary = await _ensure_login(idx, nodes[idx])
+		if login.has("error"):
+			# 连不上：换下一个结点。答了但不认这个身份/PIN：记下来，别的结点也许能用，
+			# 都不行时把这句话还给用户——它比「均不可达」有用得多。
+			if not login.get("transport", false) and loginError.is_empty():
+				loginError = login
+				loginIdx = idx
+			failure = login
+			continue
 		var r: Dictionary = await _request_node(nodes[idx], method, path, body, extra_headers, body_raw, timeout)
+		if int(r.get("status", 0)) == 401 and path != LOGIN_PATH:
+			# 服务器重启过：会话只在内存里，用存的 身份/PIN 重登一次再试。
+			_sessions.erase(_session_key(str(nodes[idx].get("url", ""))))
+			login = await _ensure_login(idx, nodes[idx])
+			if not login.has("error"):
+				r = await _request_node(nodes[idx], method, path, body, extra_headers, body_raw, timeout)
 		if not r.get("transport", false):
 			Store.set_active_server(idx)
 			return r
 		failure = r
+	if not loginError.is_empty():
+		Store.set_active_server(loginIdx)
+		return loginError
 	return failure
+
+
+## The session key for a node: its url, normalised the way it is stored.
+func _session_key(url: String) -> String:
+	return url.strip_edges().trim_suffix("/")
+
+
+## Logs into `node` when it has no session yet. Sessions live in server memory,
+## so this is also the recovery path after a server restart: the first request
+## gets a 401, the session is dropped and this logs back in with the stored
+## 身份 ID + PIN. Returns {} when logged in, {"error": …} when the server refused
+## the identity or the PIN, and a transport failure verbatim when it never
+## answered.
+func _ensure_login(idx: int, node: Dictionary) -> Dictionary:
+	var key := _session_key(str(node.get("url", "")))
+	if _sessions.has(key):
+		return {}
+	if _login_pending.has(key):
+		# 另一个请求正在登同一个结点：等它，别各自登一次。
+		while _login_pending.has(key):
+			await get_tree().process_frame
+		return {} if _sessions.has(key) else {"error": "登录中"}
+	_login_pending[key] = true
+	var body := JSON.stringify({"identity": Store.identity_of(idx), "pin": Store.pin_of(idx)})
+	var r: Dictionary = await _request_node(node, HTTPClient.METHOD_POST, LOGIN_PATH, body,
+			PackedStringArray(["Content-Type: application/json"]), PackedByteArray(), TIMEOUT_META)
+	_login_pending.erase(key)
+	if r.get("transport", false):
+		return r
+	if r.has("error"):
+		return {"error": str(r["error"]), "status": int(r.get("status", 0))}
+	var data: Dictionary = r.get("data", {}) if r.get("data") is Dictionary else {}
+	var token := str(data.get("session", ""))
+	if token == "":
+		return {"error": "登录失败：服务器没有返回会话"}
+	var ident: Dictionary = data.get("identity", {}) if data.get("identity") is Dictionary else {}
+	_sessions[key] = {"session": token, "identity_id": int(ident.get("id", 0)), "identity": str(ident.get("name", ""))}
+	_adopt_identity(idx, int(ident.get("id", 0)))
+	return {}
+
+
+## Index of the saved node with this url, -1 when it is not saved (yet).
+func _node_index(url: String) -> int:
+	var nodes := Store.servers()
+	for i in nodes.size():
+		if _session_key(str(nodes[i].get("url", ""))) == url:
+			return i
+	return -1
+
+
+## Records which identity the node's session belongs to. A different identity
+## means a different 隐私相册: nothing cached from the previous one may survive.
+func _adopt_identity(idx: int, id: int) -> void:
+	var prev := Store.identity_id_of(idx)
+	Store.set_identity_id(idx, id)
+	if prev != id:
+		_reset_for_identity()
+
+
+## Drops every piece of state that belonged to the previous identity. The cloud
+## snapshots and thumbnails are cleared with it: they hold that identity's 隐私
+## album — its name, its members, its pictures.
+func _reset_for_identity() -> void:
+	current_trunk = "系统相册"
+	current_trunk_id = 0
+	current_album_id = 0
+	current_album_name = ""
+	current_device_bucket = ""
+	current_filter = "all"
+	favorite_album_id = 0
+	scatter_album_id = 0
+	import_album_id = 0
+	_device_albums.clear()
+	_trunk_scatter.clear()
+	Store.set_last_cursor(0)
+	Cache.clear_cloud_cache()
+	Lock.lock()
+
+
+## Forgets every session: the settings page calls this after a node is saved,
+## because the node it just stored may carry a different identity or PIN than the
+## one the live sessions were opened with.
+func clear_sessions() -> void:
+	_sessions.clear()
+
+
+## Logs a node definition in. Used by the settings page before the node is saved,
+## so it builds the request itself rather than going through the node list.
+## Returns the raw result: `data` carries session/identity/registered.
+func login_node(url: String, token: String, identity: String, pin: String) -> Dictionary:
+	url = _session_key(url)
+	if url == "":
+		return {"error": "地址为空"}
+	if identity.strip_edges() == "" or pin == "":
+		return {"error": "身份 ID 与 PIN 不能为空"}
+	var node := {"url": url, "token": token}
+	var body := JSON.stringify({"identity": identity.strip_edges(), "pin": pin})
+	var r: Dictionary = await _request_node(node, HTTPClient.METHOD_POST, LOGIN_PATH, body,
+			PackedStringArray(["Content-Type: application/json"]), PackedByteArray(), TIMEOUT_META)
+	if r.get("transport", false) or r.has("error"):
+		return r
+	var data: Dictionary = r.get("data", {}) if r.get("data") is Dictionary else {}
+	var session := str(data.get("session", ""))
+	if session == "":
+		return {"error": "登录失败：服务器没有返回会话"}
+	var ident: Dictionary = data.get("identity", {}) if data.get("identity") is Dictionary else {}
+	var id := int(ident.get("id", 0))
+	_sessions[url] = {"session": session, "identity_id": id, "identity": str(ident.get("name", ""))}
+	var idx := _node_index(url)
+	if idx >= 0:
+		_adopt_identity(idx, id)
+	return r
+
+
+## Changes the logged-in identity's PIN. The server invalidates every session of
+## that identity and returns a fresh one for this caller, which replaces the one
+## the active node had.
+func set_identity_pin(pin: String, new_pin: String) -> Dictionary:
+	var r: Dictionary = await _do_request(HTTPClient.METHOD_POST, "/identity/pin",
+			JSON.stringify({"pin": pin, "new_pin": new_pin}),
+			PackedStringArray(["Content-Type: application/json"]))
+	if r.has("error"):
+		return r
+	var nodes := Store.servers()
+	if not nodes.is_empty():
+		var key := _session_key(str(nodes[clampi(Store.active_server, 0, nodes.size() - 1)].get("url", "")))
+		if _sessions.has(key):
+			_sessions[key]["session"] = str((r.get("data", {}) as Dictionary).get("session", ""))
+	return r
+
+
+## Sends a request to the server, walking the node list on transport failure:
 
 
 ## Active node first, then every other node in priority order.
@@ -118,6 +281,9 @@ func _request_node(node: Dictionary, method: int, path: String, body: String, ex
 	http.timeout = timeout
 	add_child(http)
 	var headers := PackedStringArray(["Authorization: Bearer " + str(node.get("token", ""))])
+	var sess := str((_sessions.get(_session_key(str(node.get("url", ""))), {}) as Dictionary).get("session", ""))
+	if sess != "":
+		headers.append("X-Hongni-Session: " + sess)
 	for h in extra_headers:
 		headers.append(h)
 
@@ -192,15 +358,6 @@ func probe_all() -> Array:
 	return results
 
 
-## Connectivity test for a node definition that may not be saved yet: fetches
-## the asset list so the token is validated too, not just reachability.
-func test_node(url: String, token: String) -> Dictionary:
-	url = url.strip_edges().trim_suffix("/")
-	if url == "":
-		return {"error": "地址为空"}
-	return await _request_node({"url": url, "token": token}, HTTPClient.METHOD_GET, "/assets?limit=1", "", PackedStringArray(), PackedByteArray(), TIMEOUT_META)
-
-
 ## Runs `work` on a background thread and yields each frame until it completes.
 ## The main loop stays live (no blocking), so heavy file/CPU work (building a
 ## multipart body, copying a large file, etc.) never stalls the UI. `work` must
@@ -215,10 +372,6 @@ func _bg(work: Callable) -> void:
 	while not done[0]:
 		await get_tree().process_frame
 	t.wait_to_finish()
-
-
-func check_token() -> Dictionary:
-	return await _do_request(HTTPClient.METHOD_GET, "/assets?limit=1")
 
 
 func asset_by_hash(hash: String) -> Dictionary:
@@ -306,9 +459,9 @@ func list_albums() -> Dictionary:
 	return await _do_request(HTTPClient.METHOD_GET, "/albums")
 
 
-## The 散照 bucket of a cloud trunk (`相册` / `隐私`) — where a single file lands
-## when it is moved or copied onto that trunk. Resolved from the album list on
-## first use and cached per trunk; 0 when unavailable (offline, or the trunk
+## The 散照 bucket of a cloud trunk (`共享相册` / `隐私`) — where a single file
+## lands when it is moved or copied onto that trunk. Resolved from the album list
+## on first use and cached per trunk; 0 when unavailable (offline, or the trunk
 ## holds no such bucket).
 func resolve_scatter_album(trunk_name: String = TRUNK_CLOUD) -> int:
 	if trunk_name == TRUNK_CLOUD and import_album_id > 0:
@@ -328,7 +481,7 @@ func resolve_scatter_album(trunk_name: String = TRUNK_CLOUD) -> int:
 	return id
 
 
-## The cloud album mirroring the device album `bucket_name`, under the 相册
+## The cloud album mirroring the device album `bucket_name`, under the 共享相册
 ## trunk: looked up by name and created on the first upload from that album, so
 ## the cloud side stays organised the way the system gallery is instead of
 ## piling every device photo into 散照. Resolved ids are cached for the run.
@@ -417,8 +570,15 @@ func delete_album(id: int) -> Dictionary:
 	return await _do_request(HTTPClient.METHOD_DELETE, "/albums/%d" % id)
 
 
-func add_asset_to_album(album_id: int, asset_id: int) -> Dictionary:
-	return await _do_request(HTTPClient.METHOD_POST, "/albums/%d/assets" % album_id, JSON.stringify({"asset_id": asset_id}), PackedStringArray(["Content-Type: application/json"]))
+## Files `asset_id` into `album_id`. `only_here` is 转到隐私相册: the server then
+## detaches the photo's references in the shared albums first, so "only I can see
+## it" holds even for the copies the family could see a moment ago. The response
+## carries `detached_shared`, the number of shared references it took away.
+func add_asset_to_album(album_id: int, asset_id: int, only_here: bool = false) -> Dictionary:
+	var body := {"asset_id": asset_id}
+	if only_here:
+		body["only_here"] = true
+	return await _do_request(HTTPClient.METHOD_POST, "/albums/%d/assets" % album_id, JSON.stringify(body), PackedStringArray(["Content-Type: application/json"]))
 
 
 func remove_asset_from_album(album_id: int, asset_id: int) -> Dictionary:

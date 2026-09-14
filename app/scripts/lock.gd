@@ -1,8 +1,9 @@
 extends Node
-## Parent PIN / biometric gate. Delegates PIN hashing to the Android plugin when
-## available; falls back to a pure-GDScript PBKDF2-HMAC-SHA256 (100000 iters) so
-## the gate works on desktop/editor too. Also proxies the plugin's system-album,
-## photo-picker, and mDNS discovery functionality with desktop-safe no-op stubs.
+## 身份 PIN / biometric gate. The PIN is the node's own 身份 ID + PIN — the same
+## one the server authenticates — so the door here is a local comparison against
+## it and needs no second copy of the secret to keep in sync (and works offline).
+## Also proxies the plugin's system-album, photo-picker, and mDNS discovery
+## functionality with desktop-safe no-op stubs.
 
 signal lan_result(addresses: Array)
 signal photo_picker_result(uris: Array)
@@ -21,9 +22,6 @@ signal inapp_video_prepared
 signal _pin_prompt_submitted(text: String)
 
 
-
-const ITERATIONS := 100000
-const KEY_LEN := 32
 
 var unlocked := false
 
@@ -55,38 +53,11 @@ func _plugin():
 
 # --- PIN ---
 
-func random_salt() -> String:
-	if _has_plugin():
-		var s: String = _plugin().random_salt()
-		if s != "":
-			return s
-	var bytes := PackedByteArray()
-	bytes.resize(16)
-	for i in 16:
-		bytes[i] = randi() % 256
-	return bytes.hex_encode()
-
-
-func hash_pin(pin: String, salt: String) -> String:
-	if _has_plugin():
-		var h: String = _plugin().hash_pin(pin, salt)
-		if h != "":
-			return h
-	return _pbkdf2_hex(pin.to_utf8_buffer(), _hex_decode(salt), ITERATIONS, KEY_LEN)
-
-
-func verify_pin(pin: String, salt: String, expected: String) -> bool:
-	var actual := hash_pin(pin, salt)
-	if actual.length() != expected.length():
-		return false
-	var diff := 0
-	for i in actual.length():
-		diff |= actual.unicode_at(i) ^ expected.unicode_at(i)
-	return diff == 0
-
-
+## Whether the active node carries a PIN. The PIN belongs to the node's 身份 ID:
+## one secret, typed once at setup, used both as the 隐私相册 door here and as the
+## server login credential.
 func has_pin_set() -> bool:
-	return str(Store.settings.get("master_pin_hash", "")) != ""
+	return Store.active_pin() != ""
 
 
 func is_unlocked() -> bool:
@@ -101,10 +72,21 @@ func unlock_with_pin(pin: String) -> bool:
 	if not has_pin_set():
 		unlocked = true
 		return true
-	if verify_pin(pin, Store.settings["master_pin_salt"], Store.settings["master_pin_hash"]):
-		unlocked = true
-		return true
-	return false
+	if not _constant_time_equal(pin, Store.active_pin()):
+		return false
+	unlocked = true
+	return true
+
+
+## Compares two secrets without stopping at the first difference. Overkill
+## against someone holding the unlocked device, but it costs nothing.
+func _constant_time_equal(a: String, b: String) -> bool:
+	if a.length() != b.length():
+		return false
+	var diff := 0
+	for i in a.length():
+		diff |= a.unicode_at(i) ^ b.unicode_at(i)
+	return diff == 0
 
 
 ## Blocks on a PIN prompt until unlocked. Returns true when the session is
@@ -118,21 +100,12 @@ func require_unlock() -> bool:
 	return await _prompt_pin()
 
 
-## Asks for the current PIN and verifies it *always* — even in a session that is
-## already unlocked — because proving knowledge of the old PIN is the whole point
-## (换 PIN). True when no PIN is set (nothing to prove).
-func require_current_pin() -> bool:
-	if not has_pin_set():
-		return true
-	return await _prompt_pin("输入当前 PIN")
-
-
-func _prompt_pin(prompt: String = "输入 PIN 解锁") -> bool:
+func _prompt_pin(prompt: String = "输入身份 PIN 解锁") -> bool:
 	var scene := get_tree().current_scene
 	if scene == null:
 		return false
 	var dialog := AcceptDialog.new()
-	dialog.title = "家长 PIN"
+	dialog.title = "身份 PIN"
 	dialog.dialog_text = prompt
 	var edit := LineEdit.new()
 	edit.secret = true
@@ -413,63 +386,3 @@ func consume_backup_pending() -> bool:
 	if _has_plugin():
 		return _plugin().consume_backup_pending()
 	return false
-
-
-# --- PBKDF2-HMAC-SHA256 (GDScript fallback) ---
-
-func _pbkdf2_hex(password: PackedByteArray, salt: PackedByteArray, iterations: int, dklen: int) -> String:
-	var dk := PackedByteArray()
-	var block_index := 1
-	while dk.size() < dklen:
-		var u := _hmac_sha256(password, salt + _int32_be(block_index))
-		var t := u.duplicate()
-		for i in range(1, iterations):
-			u = _hmac_sha256(password, u)
-			for j in t.size():
-				t[j] = t[j] ^ u[j]
-		dk.append_array(t)
-		block_index += 1
-	return dk.slice(0, dklen).hex_encode()
-
-
-func _hmac_sha256(key: PackedByteArray, data: PackedByteArray) -> PackedByteArray:
-	const BLOCK_SIZE := 64
-	var k := key.duplicate()
-	if k.size() > BLOCK_SIZE:
-		k = _sha256(k)
-	while k.size() < BLOCK_SIZE:
-		k.append(0)
-	var ipad := PackedByteArray()
-	var opad := PackedByteArray()
-	ipad.resize(BLOCK_SIZE)
-	opad.resize(BLOCK_SIZE)
-	for i in BLOCK_SIZE:
-		ipad[i] = k[i] ^ 0x36
-		opad[i] = k[i] ^ 0x5C
-	return _sha256(opad + _sha256(ipad + data))
-
-
-func _sha256(data: PackedByteArray) -> PackedByteArray:
-	var ctx := HashingContext.new()
-	ctx.start(HashingContext.HASH_SHA256)
-	ctx.update(data)
-	return ctx.finish()
-
-
-func _int32_be(v: int) -> PackedByteArray:
-	var b := PackedByteArray()
-	b.resize(4)
-	b[0] = (v >> 24) & 0xFF
-	b[1] = (v >> 16) & 0xFF
-	b[2] = (v >> 8) & 0xFF
-	b[3] = v & 0xFF
-	return b
-
-
-func _hex_decode(s: String) -> PackedByteArray:
-	var b := PackedByteArray()
-	var i := 0
-	while i + 1 < s.length():
-		b.append(("0x" + s.substr(i, 2)).hex_to_int())
-		i += 2
-	return b

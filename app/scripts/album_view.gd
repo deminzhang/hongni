@@ -4,7 +4,7 @@ extends Control
 ## or a device (系统相册) album. Tapping a photo opens viewer.tscn; long-pressing
 ## one switches to multi-select (a checkbox on every cell), which the bottom
 ## bar's ⋮ menu turns into batch actions: 收藏/移动到/复制到/删除 for cloud
-## assets, 上传到红泥/详细 for device media.
+## assets, 移动到/复制到/删本地保云端/从本机删除 for device media.
 ##
 ## Album context (Api.current_album_id / current_filter / current_device_bucket /
 ## current_album_name) is set by albums.gd before changing to this scene. When

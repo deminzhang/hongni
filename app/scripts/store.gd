@@ -5,10 +5,9 @@ const SETTINGS_PATH := "user://settings.json"
 const SYNC_INDEX_PATH := "user://sync_index.json"
 
 var settings: Dictionary = {
-	# Server nodes in priority order (index 0 wins): [{name, url, token}].
+	# Server nodes in priority order (index 0 wins):
+	# [{name, url, token, identity, pin, identity_id}].
 	"servers": [],
-	"master_pin_hash": "",
-	"master_pin_salt": "",
 	"last_cursor": 0,
 	"cache_clean_enabled": true,
 	"cache_min_free_mb": 1024,
@@ -46,8 +45,22 @@ func load_settings() -> void:
 			if parsed is Dictionary:
 				settings = parsed
 			f.close()
-	if _migrate_legacy_server():
+	var migrated := _migrate_legacy_server()
+	if _migrate_legacy_pin():
+		migrated = true
+	if migrated:
 		save_settings()
+
+
+## Older settings kept the 家长 PIN as a local hash. The PIN now belongs to the
+## node's 身份 ID and is checked by the server, so the local copy is dead weight
+## that can only fall out of sync with it. Drops the keys; returns true when the
+## settings dict was rewritten and needs persisting.
+func _migrate_legacy_pin() -> bool:
+	var changed := settings.has("master_pin_hash") or settings.has("master_pin_salt")
+	settings.erase("master_pin_hash")
+	settings.erase("master_pin_salt")
+	return changed
 
 
 ## Older settings held a single `server_url`/`token` pair. Fold it into the
@@ -169,12 +182,64 @@ func set_active_server(index: int) -> void:
 	active_server = clampi(index, 0, maxi(0, count - 1))
 
 
-## Configured enough to talk to a server: any node carrying address + token.
+## Configured enough to talk to a server: a node carrying address, token, and the
+## 身份 ID + PIN that log it in. An older node has only the first two, so it reads
+## as unconfigured and the app opens the settings page to complete it.
 func is_configured() -> bool:
 	for node in servers():
-		if str(node.get("url", "")) != "" and str(node.get("token", "")) != "":
+		if str(node.get("url", "")) != "" and str(node.get("token", "")) != "" \
+				and str(node.get("identity", "")) != "" and str(node.get("pin", "")) != "":
 			return true
 	return false
+
+
+## The 身份 ID of the node at `index` ("" when unset).
+func identity_of(index: int) -> String:
+	return str(server_at(index).get("identity", ""))
+
+
+## The PIN of the node at `index` ("" when unset). Kept in settings.json in the
+## clear: the device has to be able to log back in on its own after a server
+## restart, and the PIN is typed by the same person who owns the device.
+func pin_of(index: int) -> String:
+	return str(server_at(index).get("pin", ""))
+
+
+## The active node's PIN: what the 隐私相册 door is compared against, offline.
+func active_pin() -> String:
+	return pin_of(active_server)
+
+
+## Records the server-side identity id this node last logged in as. The id — not
+## the name — decides whether the cached 隐私相册 is still the right one.
+func identity_id_of(index: int) -> int:
+	return int(server_at(index).get("identity_id", 0))
+
+
+func set_identity_id(index: int, id: int) -> void:
+	var list = settings.get("servers", [])
+	if not (list is Array) or list.is_empty():
+		return
+	var i := clampi(index, 0, list.size() - 1)
+	list[i]["identity_id"] = id
+	save_settings()
+
+
+func set_server_pin(index: int, pin: String) -> void:
+	var list = settings.get("servers", [])
+	if not (list is Array) or list.is_empty():
+		return
+	var i := clampi(index, 0, list.size() - 1)
+	list[i]["pin"] = pin.strip_edges()
+	save_settings()
+
+
+## Where the change feed resumes from. Reset when the identity changes: a cursor
+## from another identity skips (or replays) changes that were never that
+## identity's to see.
+func set_last_cursor(seq: int) -> void:
+	settings["last_cursor"] = seq
+	save_settings()
 
 
 ## Trimmed entries only: nodes without an address are dropped, a blank name
@@ -192,6 +257,9 @@ func _normalize(list: Array) -> Array:
 			"name": name if name != "" else _default_name(url),
 			"url": url,
 			"token": str(e.get("token", "")).strip_edges(),
+			"identity": str(e.get("identity", "")).strip_edges(),
+			"pin": str(e.get("pin", "")).strip_edges(),
+			"identity_id": int(e.get("identity_id", 0)),
 		})
 	return out
 

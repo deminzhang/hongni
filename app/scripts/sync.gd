@@ -70,7 +70,7 @@ func scan_device_sources() -> Array:
 
 
 ## Cloud-side half of a sync: retry the queued deletes and pull remote changes
-## so 红泥相册 / 隐私相册 stay current without a full pass. The album browser runs
+## so 共享相册 / 隐私相册 stay current without a full pass. The album browser runs
 ## this on entry; uploading the device gallery stays manual (立即同步).
 func sync_cloud() -> void:
 	if running:
@@ -229,10 +229,13 @@ func _prune_device_deletions(sources: Array) -> Dictionary:
 			continue
 		if asset_id > 0 and not claimed.has(asset_id):
 			var r: Dictionary = await Api.delete_asset(asset_id)
-			if r.has("error"):
+			# 404 = 云端已经没有了（不属于当前身份，或已被删除）。继续留着索引只会
+			# 每趟重试一次，所以按「已不在云端」处理。
+			if r.has("error") and int(r.get("status", 0)) != 404:
 				continue  # cloud unreachable: keep the entry, retry next sync
-			Cache.remove_original_by_id(asset_id)
-			deleted += 1
+			if not r.has("error"):
+				Cache.remove_original_by_id(asset_id)
+				deleted += 1
 		Store.erase_index_entry(key)
 		pruned += 1
 	Store.end_batch()
@@ -256,8 +259,13 @@ func _process_pending_deletes() -> void:
 			continue
 		var r: Dictionary = await Api.delete_asset(cid, album_id)
 		if r.has("error"):
-			remaining.append(entry)
-		elif bool(r.get("data", {}).get("trashed", false)):
+			# 404 = 云端已经没有它了（不属于当前身份，或已删除）。留着这条墓碑只会
+			# 每趟同步重试一次，所以直接丢弃；其它错误是真的没送达，留着重试。
+			if int(r.get("status", 0)) != 404:
+				remaining.append(entry)
+			continue
+		var data = r.get("data")
+		if data is Dictionary and bool(data.get("trashed", false)):
 			remove_local(cid)
 	Store.settings["pending_deletes"] = remaining
 	Store.save_settings()
@@ -288,8 +296,7 @@ func _pull_changes() -> void:
 				remove_local(eid)
 		# album / album_asset changes carry no local copy to update; the UI
 		# re-fetches album membership itself.
-	Store.settings["last_cursor"] = max_seq
-	Store.save_settings()
+	Store.set_last_cursor(max_seq)
 
 
 func _cache_remote_thumb(asset_id: int) -> void:

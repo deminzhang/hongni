@@ -110,6 +110,28 @@ func offline_assets(album_id: int, filter: String = "all") -> Array:
 	return list
 
 
+## Clears the cloud snapshot and every cached file. Called whenever the identity
+## changes: the snapshot holds the previous identity's 隐私相册 — its name, its
+## members — and the thumbnails may be its pictures. Device-gallery data is not
+## touched; none of it lives here.
+func clear_cloud_cache() -> void:
+	albums_cache = []
+	members_cache.clear()
+	viewed.clear()
+	_save_catalog()
+	for d in [THUMB_DIR, ORIG_DIR]:
+		var dir := DirAccess.open(d)
+		if dir == null:
+			continue
+		dir.list_dir_begin()
+		var n := dir.get_next()
+		while n != "":
+			if not dir.current_is_dir():
+				DirAccess.remove_absolute(d + "/" + n)
+			n = dir.get_next()
+		dir.list_dir_end()
+
+
 ## Plain albums keep the historical bare-id key, so catalog.json written by an
 ## older build still reads back.
 static func _member_key(album_id: int, filter: String) -> String:

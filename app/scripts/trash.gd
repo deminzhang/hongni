@@ -29,7 +29,7 @@ var _ctx_asset_id := 0
 func _ready() -> void:
 	_trunk_id = Api.current_trunk_id
 	_trunk_name = Api.current_trunk
-	if _trunk_name == "隐私" and not await Lock.require_unlock():
+	if _trunk_name == Api.TRUNK_PRIVATE and not await Lock.require_unlock():
 		_go_back()
 		return
 	_build_ui()

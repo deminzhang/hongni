@@ -15,8 +15,8 @@ extends Control
 ##
 ## Device (系统相册) items are shown from the device's own copy: an aspect-
 ## preserving preview (plugin decoder on Android, direct decode on desktop),
-## videos via the same in-app/OS players, and only the ⋮ menu's 上传到红泥 /
-## 详细 (删除/存到相册 belong to the cloud and stay hidden).
+## videos via the same in-app/OS players, and only the ⋮ menu's 移动到/复制到/
+## 删本地保云端/从本机删除/详细 (删除/存到相册 belong to the cloud and stay hidden).
 
 const SWIPE_THRESHOLD := 80.0
 # Touch height of the top-bar 返回 (~48dp once the 600px base is scaled up).

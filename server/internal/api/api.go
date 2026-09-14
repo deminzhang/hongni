@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -12,49 +14,68 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/deminzhang/hongni/server/internal/blob"
 	"github.com/deminzhang/hongni/server/internal/config"
 	"github.com/deminzhang/hongni/server/internal/store"
 )
 
+// session is who a request is acting as: the identity resolved from its
+// X-Hongni-Session token.
+type session struct {
+	identityID int64
+	name       string
+}
+
 // server wires the store, blob store, and config into HTTP handlers.
 type server struct {
 	store *store.Store
 	blob  *blob.Store
 	cfg   config.Config
+
+	// mu guards sessions. Sessions live in memory only: a restart logs everyone
+	// out, and the clients log straight back in with the 身份 ID + PIN they keep.
+	mu       sync.RWMutex
+	sessions map[string]session
 }
 
 // New assembles the full HTTP handler: /health unauthenticated, and an
-// authenticated /api/v1/ subtree requiring a Bearer token.
+// authenticated /api/v1/ subtree requiring a Bearer token. Inside that, the
+// data routes additionally require a session (X-Hongni-Session), which is what
+// decides whose 隐私相册 is in view; only /identity/login is reachable with the
+// token alone.
 func New(s *store.Store, b *blob.Store, cfg config.Config) http.Handler {
-	sv := &server{store: s, blob: b, cfg: cfg}
+	sv := &server{store: s, blob: b, cfg: cfg, sessions: map[string]session{}}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", sv.handleHealth)
 
 	api := http.NewServeMux()
-	api.HandleFunc("GET /assets", sv.handleListAssets)
-	api.HandleFunc("POST /assets", sv.handleCreateAsset)
+	api.HandleFunc("POST /identity/login", sv.handleIdentityLogin)
+	api.HandleFunc("POST /identity/pin", sv.withIdentity(sv.handleIdentityPin))
+	api.HandleFunc("GET /assets", sv.withIdentity(sv.handleListAssets))
+	api.HandleFunc("POST /assets", sv.withIdentity(sv.handleCreateAsset))
 	// The by-hash / {id}/original / {id}/thumb sub-paths overlap under stdlib
 	// ServeMux wildcard rules, so they are dispatched manually in one handler
 	// (exact plan URLs are preserved).
-	api.HandleFunc("GET /assets/{path...}", sv.handleAssetGet)
-	api.HandleFunc("DELETE /assets/{id}", sv.handleDeleteAsset)
-	api.HandleFunc("PATCH /assets/{id}", sv.handleAssetPatch)
-	api.HandleFunc("GET /albums", sv.handleListAlbums)
-	api.HandleFunc("POST /albums", sv.handleCreateAlbum)
-	api.HandleFunc("PATCH /albums/{id}", sv.handleUpdateAlbum)
-	api.HandleFunc("DELETE /albums/{id}", sv.handleDeleteAlbum)
-	api.HandleFunc("POST /albums/{id}/assets", sv.handleAddAssetToAlbum)
-	api.HandleFunc("POST /albums/{id}/move", sv.handleMoveAlbum)
-	api.HandleFunc("DELETE /albums/{id}/assets/{asset_id}", sv.handleRemoveAssetFromAlbum)
-	api.HandleFunc("GET /trash", sv.handleListTrash)
-	api.HandleFunc("POST /trash/{id}/restore", sv.handleRestoreAsset)
-	api.HandleFunc("DELETE /trash/{id}", sv.handleDeleteTrashAsset)
-	api.HandleFunc("DELETE /trash", sv.handleClearTrash)
-	api.HandleFunc("GET /sync/changes", sv.handleSyncChanges)
+	api.HandleFunc("GET /assets/{path...}", sv.withIdentity(sv.handleAssetGet))
+	api.HandleFunc("DELETE /assets/{id}", sv.withIdentity(sv.handleDeleteAsset))
+	api.HandleFunc("PATCH /assets/{id}", sv.withIdentity(sv.handleAssetPatch))
+	api.HandleFunc("GET /albums", sv.withIdentity(sv.handleListAlbums))
+	api.HandleFunc("POST /albums", sv.withIdentity(sv.handleCreateAlbum))
+	api.HandleFunc("PATCH /albums/{id}", sv.withIdentity(sv.handleUpdateAlbum))
+	api.HandleFunc("DELETE /albums/{id}", sv.withIdentity(sv.handleDeleteAlbum))
+	api.HandleFunc("POST /albums/{id}/assets", sv.withIdentity(sv.handleAddAssetToAlbum))
+	api.HandleFunc("POST /albums/{id}/move", sv.withIdentity(sv.handleMoveAlbum))
+	api.HandleFunc("DELETE /albums/{id}/assets/{asset_id}", sv.withIdentity(sv.handleRemoveAssetFromAlbum))
+	api.HandleFunc("GET /trash", sv.withIdentity(sv.handleListTrash))
+	api.HandleFunc("POST /trash/{id}/restore", sv.withIdentity(sv.handleRestoreAsset))
+	api.HandleFunc("DELETE /trash/{id}", sv.withIdentity(sv.handleDeleteTrashAsset))
+	api.HandleFunc("DELETE /trash", sv.withIdentity(sv.handleClearTrash))
+	api.HandleFunc("GET /sync/changes", sv.withIdentity(sv.handleSyncChanges))
 
 	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", sv.auth(api)))
 	return mux
@@ -84,12 +105,174 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+	writeJSON(w, code, map[string]any{"error": msg})
+}
+
+// storeErr turns a store error into the response: ErrNotFound is a 404 — the
+// caller can tell "gone" from "it exists but is not yours", and for a photo in
+// someone else's 隐私相册 the two are the same answer on purpose.
+func storeErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, err.Error())
+}
+
+type ctxKey int
+
+const identityKey ctxKey = 0
+
+// sessionOf returns the identity behind the request. Handlers reachable without
+// a session (the login route) get the zero value.
+func sessionOf(r *http.Request) session {
+	sess, _ := r.Context().Value(identityKey).(session)
+	return sess
+}
+
+// withIdentity requires a live session and hands it to the handler through the
+// request context.
+func (s *server) withIdentity(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sess, ok := s.lookupSession(r.Header.Get("X-Hongni-Session"))
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, "未登录")
+			return
+		}
+		h(w, r.WithContext(context.WithValue(r.Context(), identityKey, sess)))
+	}
+}
+
+// newSession mints a session token for an identity and remembers it.
+func (s *server) newSession(id int64, name string) (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(buf)
+	s.mu.Lock()
+	s.sessions[token] = session{identityID: id, name: name}
+	s.mu.Unlock()
+	return token, nil
+}
+
+func (s *server) lookupSession(token string) (session, bool) {
+	if token == "" {
+		return session{}, false
+	}
+	s.mu.RLock()
+	sess, ok := s.sessions[token]
+	s.mu.RUnlock()
+	return sess, ok
+}
+
+// dropSessions 作废该身份的全部会话：PIN 换过之后，旧会话不该继续有效。
+func (s *server) dropSessions(identityID int64) {
+	s.mu.Lock()
+	for token, sess := range s.sessions {
+		if sess.identityID == identityID {
+			delete(s.sessions, token)
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+// handleIdentityLogin exchanges 身份 ID + PIN for a session. An unknown name
+// registers with the PIN given here — 首次注册为准 — and is handed its 隐私
+// trunk; a known name has to match the stored PIN.
+func (s *server) handleIdentityLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Identity string `json:"identity"`
+		PIN      string `json:"pin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	name := strings.TrimSpace(req.Identity)
+	if !validIdentityName(name) {
+		writeErr(w, http.StatusBadRequest, "身份 ID 需为 1–32 个字符")
+		return
+	}
+	if !validPIN(req.PIN) {
+		writeErr(w, http.StatusBadRequest, "PIN 需为 4–6 位数字")
+		return
+	}
+
+	ident, registered, err := s.store.AuthIdentity(r.Context(), name, req.PIN)
+	if errors.Is(err, store.ErrIdentityPIN) {
+		writeErr(w, http.StatusUnauthorized, "身份 ID 或 PIN 不正确")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	token, err := s.newSession(ident.ID, ident.Name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	privateID, err := s.store.PrivateTrunkID(r.Context(), ident.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	sharedID, err := s.store.SharedTrunkID(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session":          token,
+		"identity":         ident,
+		"private_trunk_id": privateID,
+		"shared_trunk_id":  sharedID,
+		"registered":       registered,
+	})
+}
+
+// handleIdentityPin changes the caller's own PIN and rotates its sessions: the
+// old ones are dropped (a changed PIN must not leave old logins alive) and the
+// caller is handed a fresh one so it stays logged in.
+func (s *server) handleIdentityPin(w http.ResponseWriter, r *http.Request) {
+	sess := sessionOf(r)
+	var req struct {
+		PIN    string `json:"pin"`
+		NewPIN string `json:"new_pin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !validPIN(req.NewPIN) {
+		writeErr(w, http.StatusBadRequest, "PIN 需为 4–6 位数字")
+		return
+	}
+
+	err := s.store.SetIdentityPIN(r.Context(), sess.identityID, req.PIN, req.NewPIN)
+	if errors.Is(err, store.ErrIdentityPIN) {
+		writeErr(w, http.StatusUnauthorized, "当前 PIN 不正确")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.dropSessions(sess.identityID)
+	token, err := s.newSession(sess.identityID, sess.name)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "session": token})
 }
 
 // assetResponse extends an Asset with the upload-only fields deduplicated/thumb.
@@ -126,9 +309,9 @@ func (s *server) handleListAssets(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 
-	assets, next, err := s.store.ListAssets(r.Context(), filter, albumID, q.Get("cursor"), limit)
+	assets, next, err := s.store.ListAssets(r.Context(), filter, albumID, q.Get("cursor"), limit, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"assets": assets, "next_cursor": next})
@@ -170,20 +353,16 @@ func (s *server) handleAssetGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAssetJSON(w http.ResponseWriter, r *http.Request, id int64) {
-	a, err := s.store.GetAsset(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "not found")
-		return
-	}
+	a, err := s.store.GetAssetVisible(r.Context(), id, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
 }
 
 func (s *server) handleAssetByHash(w http.ResponseWriter, r *http.Request, hash string) {
-	a, found, err := s.store.GetAssetByHash(r.Context(), hash)
+	a, found, err := s.store.GetAssetByHash(r.Context(), hash, sessionOf(r).identityID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -233,6 +412,15 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 			albumID = n
 		}
 	}
+	identityID := sessionOf(r).identityID
+	// 目标相册必须是这个身份看得见的：看不见就当不存在。少了这一步，一次带着别人
+	// 隐私主干 id 的上传会在入册失败后由 散照 兜底塞进那个人的隐私相册里。
+	if albumID > 0 {
+		if _, err := s.store.VisibleAlbum(r.Context(), albumID, identityID); err != nil {
+			storeErr(w, err)
+			return
+		}
+	}
 	// The client supplies the MIME type and it is echoed back as the
 	// Content-Type of /original, so only media types are accepted: an upload can
 	// never turn the server's own origin into a text/html (or script) host.
@@ -262,7 +450,7 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	hashHex := hex.EncodeToString(h.Sum(nil))
 
-	_, dedup, err := s.store.GetAssetByHash(r.Context(), hashHex)
+	_, dedup, err := s.store.GetAssetByHash(r.Context(), hashHex, identityID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -278,7 +466,7 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if existing > 0 {
-			if err := s.store.AddAssetToAlbum(r.Context(), albumID, existing); err != nil {
+			if _, err := s.store.AddAssetToAlbum(r.Context(), albumID, existing, identityID, false); err != nil {
 				writeErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
@@ -351,9 +539,9 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 		// Filing must not be silently skippable: an asset held by no album shows
 		// up in no listing and in no recycle bin. When the link fails, park it in
 		// the trunk's 散照 so the photo is still visible and restorable.
-		if err := s.store.AddAssetToAlbum(r.Context(), albumID, id); err != nil {
+		if _, err := s.store.AddAssetToAlbum(r.Context(), albumID, id, identityID, false); err != nil {
 			log.Printf("asset %d: add to album %d failed: %v", id, albumID, err)
-			if perr := s.store.ParkAsset(r.Context(), id); perr != nil {
+			if perr := s.store.ParkAsset(r.Context(), id, albumID); perr != nil {
 				log.Printf("asset %d: parking after failed link also failed: %v", id, perr)
 			}
 		}
@@ -363,13 +551,9 @@ func (s *server) handleCreateAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleOriginal(w http.ResponseWriter, r *http.Request, id int64) {
-	a, err := s.store.GetAsset(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "not found")
-		return
-	}
+	a, err := s.store.GetAssetVisible(r.Context(), id, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	rc, err := s.blob.Open(a.Hash)
@@ -387,13 +571,9 @@ func (s *server) handleOriginal(w http.ResponseWriter, r *http.Request, id int64
 }
 
 func (s *server) handleThumb(w http.ResponseWriter, r *http.Request, id int64) {
-	a, err := s.store.GetAsset(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "not found")
-		return
-	}
+	a, err := s.store.GetAssetVisible(r.Context(), id, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	rc, err := s.blob.OpenThumb(a.Hash)
@@ -413,25 +593,26 @@ func (s *server) handleDeleteAsset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid id")
 		return
 	}
+	identityID := sessionOf(r).identityID
+	if _, err := s.store.GetAssetVisible(r.Context(), id, identityID); err != nil {
+		storeErr(w, err)
+		return
+	}
 	// `album_id` says which album the delete came from. Inside a real album that
 	// means "drop this album's copy": the photo itself only reaches the recycle
 	// bin when no other album holds it. 全部 / 视频 / 收藏 are views of the whole
 	// library, so deleting there still means deleting the photo.
 	if v := r.URL.Query().Get("album_id"); v != "" {
 		if albumID, err := strconv.ParseInt(v, 10, 64); err == nil && albumID > 0 {
-			scoped, err := s.store.AlbumScopedDelete(r.Context(), albumID)
+			scoped, err := s.store.AlbumScopedDelete(r.Context(), albumID, identityID)
 			if err != nil {
-				writeErr(w, http.StatusInternalServerError, err.Error())
+				storeErr(w, err)
 				return
 			}
 			if scoped {
-				trashed, err := s.store.RemoveOrTrash(r.Context(), albumID, id)
-				if errors.Is(err, store.ErrNotFound) {
-					writeErr(w, http.StatusNotFound, "not found")
-					return
-				}
+				trashed, err := s.store.RemoveOrTrash(r.Context(), albumID, id, identityID)
 				if err != nil {
-					writeErr(w, http.StatusInternalServerError, err.Error())
+					storeErr(w, err)
 					return
 				}
 				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "trashed": trashed})
@@ -455,6 +636,10 @@ func (s *server) handleAssetPatch(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := s.store.GetAssetVisible(r.Context(), id, sessionOf(r).identityID); err != nil {
+		storeErr(w, err)
 		return
 	}
 	var req struct {
@@ -516,9 +701,9 @@ func (s *server) handleListTrash(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	assets, next, err := s.store.ListTrash(r.Context(), trunkID, q.Get("cursor"), limit)
+	assets, next, err := s.store.ListTrash(r.Context(), trunkID, q.Get("cursor"), limit, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"assets": assets, "next_cursor": next})
@@ -528,6 +713,10 @@ func (s *server) handleRestoreAsset(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := s.store.GetAssetVisible(r.Context(), id, sessionOf(r).identityID); err != nil {
+		storeErr(w, err)
 		return
 	}
 	a, err := s.store.RestoreAsset(r.Context(), id)
@@ -548,6 +737,10 @@ func (s *server) handleDeleteTrashAsset(w http.ResponseWriter, r *http.Request) 
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := s.store.GetAssetVisible(r.Context(), id, sessionOf(r).identityID); err != nil {
+		storeErr(w, err)
 		return
 	}
 	hash, refsLeft, err := s.store.DeleteAsset(r.Context(), id)
@@ -579,9 +772,9 @@ func (s *server) handleClearTrash(w http.ResponseWriter, r *http.Request) {
 		}
 		trunkID = &id
 	}
-	hashes, err := s.store.ClearTrash(r.Context(), trunkID)
+	hashes, err := s.store.ClearTrash(r.Context(), trunkID, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	for _, h := range hashes {
@@ -593,9 +786,9 @@ func (s *server) handleClearTrash(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleListAlbums(w http.ResponseWriter, r *http.Request) {
-	albums, err := s.store.ListAlbums(r.Context())
+	albums, err := s.store.ListAlbums(r.Context(), sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"albums": albums})
@@ -626,9 +819,9 @@ func (s *server) handleCreateAlbum(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid sync_mode")
 		return
 	}
-	id, err := s.store.CreateAlbum(r.Context(), strings.TrimSpace(req.Name), req.ParentID, req.IsHidden, mode)
+	id, err := s.store.CreateAlbum(r.Context(), strings.TrimSpace(req.Name), req.ParentID, req.IsHidden, mode, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	a, err := s.store.GetAlbum(r.Context(), id)
@@ -643,6 +836,10 @@ func (s *server) handleUpdateAlbum(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := s.store.VisibleAlbum(r.Context(), id, sessionOf(r).identityID); err != nil {
+		storeErr(w, err)
 		return
 	}
 
@@ -718,13 +915,18 @@ func (s *server) handleDeleteAlbum(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	err = s.store.DeleteAlbum(r.Context(), id)
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "not found")
+	al, err := s.store.VisibleAlbum(r.Context(), id, sessionOf(r).identityID)
+	if err != nil {
+		storeErr(w, err)
 		return
 	}
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	// 主干是库本身：它没有父级，删掉之后这个身份连自己的 隐私 都再也找不到。
+	if al.ParentID == nil {
+		writeErr(w, http.StatusBadRequest, "不能删除顶层相册")
+		return
+	}
+	if err := s.store.DeleteAlbum(r.Context(), id); err != nil {
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -753,7 +955,7 @@ func (s *server) handleMoveAlbum(w http.ResponseWriter, r *http.Request) {
 			req.ParentID = nil // 0 与 null 同义，都表示移到主干层级
 		}
 	}
-	album, mergedInto, moved, err := s.store.MoveAlbum(r.Context(), id, req.ParentID)
+	album, mergedInto, moved, err := s.store.MoveAlbum(r.Context(), id, req.ParentID, sessionOf(r).identityID)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "album not found")
@@ -778,8 +980,12 @@ func (s *server) handleAddAssetToAlbum(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid id")
 		return
 	}
+	// only_here is 转到隐私相册: the client says the photo is moving, not being
+	// copied, so the server drops its references in the shared albums rather
+	// than trusting the client to clean up after itself.
 	var req struct {
-		AssetID int64 `json:"asset_id"`
+		AssetID  int64 `json:"asset_id"`
+		OnlyHere bool  `json:"only_here"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -789,11 +995,12 @@ func (s *server) handleAddAssetToAlbum(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "asset_id is required")
 		return
 	}
-	if err := s.store.AddAssetToAlbum(r.Context(), albumID, req.AssetID); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	detached, err := s.store.AddAssetToAlbum(r.Context(), albumID, req.AssetID, sessionOf(r).identityID, req.OnlyHere)
+	if err != nil {
+		storeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "detached_shared": detached})
 }
 
 func (s *server) handleRemoveAssetFromAlbum(w http.ResponseWriter, r *http.Request) {
@@ -810,13 +1017,9 @@ func (s *server) handleRemoveAssetFromAlbum(w http.ResponseWriter, r *http.Reque
 	// Dropping a reference never leaves the photo without a home: taking it out
 	// of its last album parks it in that trunk's 散照 (see RemoveOrPark), which
 	// is what un-starring a favourite has to mean.
-	parked, err := s.store.RemoveOrPark(r.Context(), albumID, assetID)
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "not found")
-		return
-	}
+	parked, err := s.store.RemoveOrPark(r.Context(), albumID, assetID, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "parked": parked})
@@ -832,9 +1035,9 @@ func (s *server) handleSyncChanges(w http.ResponseWriter, r *http.Request) {
 		}
 		cursor = n
 	}
-	changes, err := s.store.GetChanges(r.Context(), cursor)
+	changes, err := s.store.GetChanges(r.Context(), cursor, sessionOf(r).identityID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		storeErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"changes": changes})
@@ -854,6 +1057,26 @@ func validSyncMode(m string) bool {
 		return true
 	}
 	return false
+}
+
+// validPIN accepts 4–6 digits: long enough that guessing is not free, short
+// enough that a family member actually types it at the 隐私相册 door.
+func validPIN(s string) bool {
+	if len(s) < 4 || len(s) > 6 {
+		return false
+	}
+	for i := range len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validIdentityName accepts 1–32 characters of a name already trimmed.
+func validIdentityName(s string) bool {
+	n := utf8.RuneCountInString(s)
+	return n >= 1 && n <= 32
 }
 
 func defaultMime(name, mediaType string) string {
