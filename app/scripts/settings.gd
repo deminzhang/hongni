@@ -5,6 +5,8 @@ extends Control
 
 enum NodeStatus { UNKNOWN, OK, FAIL }
 
+const SAFE_AREA := preload("res://scripts/safe_area.gd")
+
 # Touch height of the top-bar 返回: at the stretch scale (screen width / 600) this
 # lands at ~48dp on a phone, the Android minimum for a finger target.
 const BACK_BTN_H := 72
@@ -55,6 +57,8 @@ func _build_ui() -> void:
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	root.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	add_child(root)
+	# 刘海 / 屏幕圆角：整页下移到安全区以下，顶栏两端不再被切（桌面留 0）。
+	SAFE_AREA.apply(root)
 
 	var v := VBoxContainer.new()
 	v.size_flags_horizontal = Control.SIZE_EXPAND_FILL

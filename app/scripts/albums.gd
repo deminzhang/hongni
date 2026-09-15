@@ -28,13 +28,20 @@ const ALL := "全部"
 # Only for its static dropdown-sizing helper: the move picker must measure names
 # the same way the asset menu's does, and that logic lives in one place.
 const ASSET_MENU := preload("res://scripts/asset_menu.gd")
+const SAFE_AREA := preload("res://scripts/safe_area.gd")
 const VIDEO := "视频"
 const VIDEO_FILTER := "videos"
 const TRUNK_COLUMNS := 2
-# Card is just the preview icon (mostly) plus a single-line name label. Width is
-# what caps this: 2 columns + the 16px h_separation must fit the 600px base
-# viewport (592 of 600).
-const CARD_SIZE := Vector2(288, 276)
+# Space between two cards; the cards divide the screen width minus this (and the
+# grid's scrollbar) between themselves, so a row always fits the real screen.
+const CARD_SEPARATION := 16
+# Card shape, as fractions of the card's width: a square cover box with the name
+# row under it (the 288x276 card this replaces described the cover alone, and a
+# device cover — a square centre-crop — was what set the card's real height).
+# Every cover is scaled to fit inside that box, so a square one fills the card
+# the way it always did and a wide one is letterboxed like the photo grid.
+const CARD_COVER_RATIO := 1.0
+const CARD_NAME_RATIO := 0.15
 # Top-bar icon buttons (+ / ⋮): square touch targets sized like 返回.
 const TOP_BTN_SIZE := Vector2(72, 72)
 # Device card covers decoded per frame on Android (the plugin bridge decodes on
@@ -89,6 +96,8 @@ func _ready() -> void:
 	# off instead of always resetting to 共享相册.
 	current_trunk = _restore_trunk()
 	_build_ui()
+	# 旋转 / 改窗口大小后列宽会变:两列仍然要铺满,卡片高度跟着重算。
+	get_viewport().size_changed.connect(_on_viewport_resized)
 	_sync_trunk_state()
 	Cache.enforce_cache()
 	_reload_context.call_deferred()
@@ -122,7 +131,7 @@ func _process(_dt: float) -> void:
 		var cover: Dictionary = _thumb_queue.pop_front()
 		var key := DeviceMedia.key_of(cover)
 		if _device_cards.has(key):
-			_apply_device_card_thumb(key, DeviceMedia.decode_thumb_now(cover, int(CARD_SIZE.x)))
+			_apply_device_card_thumb(key, DeviceMedia.decode_thumb_now(cover, _card_width()))
 		budget -= 1
 
 
@@ -130,6 +139,8 @@ func _build_ui() -> void:
 	var root := VBoxContainer.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	add_child(root)
+	# 刘海 / 屏幕圆角：整个界面下移到安全区以下，顶栏两端不再被切（桌面留 0）。
+	SAFE_AREA.apply(root)
 
 	# --- Top bar: the three parallel trunks, then the album actions on the right ---
 	var top := HBoxContainer.new()
@@ -185,8 +196,8 @@ func _build_ui() -> void:
 	card_grid = GridContainer.new()
 	card_grid.columns = TRUNK_COLUMNS
 	card_grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	card_grid.add_theme_constant_override("h_separation", 16)
-	card_grid.add_theme_constant_override("v_separation", 16)
+	card_grid.add_theme_constant_override("h_separation", CARD_SEPARATION)
+	card_grid.add_theme_constant_override("v_separation", CARD_SEPARATION)
 	card_scroll.add_child(card_grid)
 
 	# --- Long-press context menu (album rename/delete) ---
@@ -391,10 +402,55 @@ func _find_trunk(albums: Array, name: String) -> Dictionary:
 	return {}
 
 
-func _add_card(label: String, album_id: int, cover_id: int = 0, filter: String = "all") -> void:
+## Logical width of one card on the screen in front of us: the two columns plus
+## the grid's own separation split the width the device reports — 600 units on
+## the 600x1280 base viewport, more on a tablet or a landscape window. The cards
+## are handed their width by the grid (both columns expand, so the row also fits
+## when the scrollbar is out); this is what a cover is decoded at and what the
+## card's height follows.
+func _card_width() -> int:
+	var vw := get_viewport_rect().size.x
+	return maxi(1, int(floorf((vw - CARD_SEPARATION * float(TRUNK_COLUMNS - 1)) / float(TRUNK_COLUMNS))))
+
+
+## Card height for the current screen width, keeping the card's shape instead of
+## its exact pixels: a wide screen gets a proportionally taller card (and the
+## square cover box with it), not a squashed one.
+func _card_height() -> float:
+	return roundf(float(_card_width()) * (CARD_COVER_RATIO + CARD_NAME_RATIO))
+
+
+## One album card. Its width is the grid's to hand out — which is what keeps a
+## cover from deciding the layout at all: covers are decoded at the phone's real
+## pixels (DeviceMedia.thumb_px) and `expand_icon` draws them scaled into
+## whatever space the card has, so a big cover can no longer widen its column and
+## push the second card off-screen. The name is clipped rather than allowed to
+## widen the cell (long device album names), and the height is the only part of
+## the size the card has to state itself.
+func _make_card(text: String) -> Button:
 	var btn := Button.new()
-	btn.custom_minimum_size = CARD_SIZE
-	btn.text = label
+	btn.text = text
+	btn.expand_icon = true
+	btn.clip_text = true
+	btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	btn.custom_minimum_size = Vector2(0, _card_height())
+	btn.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_TOP
+	return btn
+
+
+## A rotation or a window resize changes the column width: re-measure the cards
+## so their shape follows (the covers are drawn scaled, so they follow by
+## themselves — no re-decode needed).
+func _on_viewport_resized() -> void:
+	var size := Vector2(0, _card_height())
+	for c in card_grid.get_children():
+		if c is Control:
+			(c as Control).custom_minimum_size = size
+
+
+func _add_card(label: String, album_id: int, cover_id: int = 0, filter: String = "all") -> void:
+	var btn := _make_card(label)
 	btn.set_meta("album_id", album_id)
 	btn.set_meta("album_name", label)
 	btn.set_meta("album_filter", filter)
@@ -441,10 +497,13 @@ func _load_card_preview(album_id: int, btn: Button, cover_id: int = 0, filter: S
 		return
 	var img := Image.new()
 	if img.load_jpg_from_buffer(body) == OK:
-		img.resize(int(CARD_SIZE.x), int(CARD_SIZE.y * 0.88), Image.INTERPOLATE_BILINEAR)
+		# 服务端按 512px 存缩略图,这里只按「屏幕上实际显示多大」降采样(和本机
+		# 缩略图同一条规则),够小的图原样交给 GPU 放大;等比缩放,不再压扁照片
+		# ——卡片高度由屏幕决定,照片比例不能跟着变。
+		var px := DeviceMedia.thumb_px(_card_width())
+		if img.get_width() > px:
+			img.resize(px, maxi(1, int(round(float(px) * float(img.get_height()) / float(img.get_width())))), Image.INTERPOLATE_BILINEAR)
 		btn.icon = ImageTexture.create_from_image(img)
-		btn.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_TOP
 
 
 ## Thumbnail bytes for one asset id: the local cache first, then the server when
@@ -487,9 +546,7 @@ func _reload_device_context() -> void:
 ## a cloud trunk — 全部/视频 are virtual aggregations and stay tap-only, as does
 ## the album itself being the device's own.
 func _add_device_card(bucket_id: String, name: String, count: int, cover, album_card := false) -> void:
-	var btn := Button.new()
-	btn.custom_minimum_size = CARD_SIZE
-	btn.text = name
+	var btn := _make_card(name)
 	btn.tooltip_text = "%d 项" % count
 	btn.set_meta("album_name", name)
 	if album_card:
@@ -504,13 +561,16 @@ func _add_device_card(bucket_id: String, name: String, count: int, cover, album_
 	if not _device_cards.has(key):
 		_device_cards[key] = []
 	_device_cards[key].append(btn)
-	var img := DeviceMedia.cached_thumb(cover, int(CARD_SIZE.x))
+	# 本机缩略图按屏幕上的实际大小解码(手机上物理像素更大),缓存文件名跟着
+	# 尺寸走;卡片用 expand_icon 缩放显示,所以这张图多大都不会撑开列宽。
+	var size := _card_width()
+	var img := DeviceMedia.cached_thumb(cover, size)
 	if img.get_width() > 0:
 		_apply_device_card_thumb(key, img)
 	elif DeviceMedia.decodes_in_caller():
 		_thumb_queue.append(cover)
 	else:
-		DeviceMedia.queue_thumb(cover, int(CARD_SIZE.x))
+		DeviceMedia.queue_thumb(cover, size)
 
 
 func _apply_device_card_thumb(key: String, img: Image) -> void:

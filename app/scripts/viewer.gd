@@ -57,11 +57,16 @@ const FRAME_SETTLE_MS := 700
 const EARLY_DEATH_MS := 2500
 
 const ASSET_MENU := preload("res://scripts/asset_menu.gd")
+const SAFE_AREA := preload("res://scripts/safe_area.gd")
 
 var top_bar: HBoxContainer
 var bottom_row: HBoxContainer
 var label_status: Label
 var texture_rect: TextureRect
+# Empty band above the top bar on a phone: the notch / rounded screen corners
+# must not cut the 返回 / ‹ / › buttons. Hidden with the rest of the chrome, so a
+# tap-to-hide still gives the picture the whole screen.
+var top_pad: Control
 var btn_delete: Button
 var btn_save: Button
 var btn_center_play: Button
@@ -123,6 +128,13 @@ func _build_ui() -> void:
 	# Swipes starting anywhere except buttons must reach _gui_input below.
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	add_child(root)
+
+	# 刘海 / 屏幕圆角：垫在顶栏之上的空条，让 返回/‹/› 落到圆角以下；隐藏周边
+	# UI 时它跟着一起收起来，画面照旧铺满整屏。
+	top_pad = Control.new()
+	top_pad.custom_minimum_size = Vector2(0, SAFE_AREA.top_inset())
+	top_pad.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(top_pad)
 
 	top_bar = HBoxContainer.new()
 	top_bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -634,6 +646,7 @@ func _delete_current() -> void:
 func _set_chrome_visible(show: bool) -> void:
 	_chrome_visible = show
 	top_bar.visible = show
+	top_pad.visible = show
 	bottom_row.visible = show
 	label_status.visible = show
 	_refresh_transport()

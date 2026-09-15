@@ -5,6 +5,7 @@ extends Control
 ## trunk bin. 主相册 and 隐私 have independent bins (per-trunk provenance
 ## recorded at delete time).
 
+const SAFE_AREA := preload("res://scripts/safe_area.gd")
 const THUMB_SIZE := 140
 # Touch height of the top-bar 返回 (~48dp once the 600px base is scaled up).
 const BACK_BTN_H := 72
@@ -40,6 +41,8 @@ func _build_ui() -> void:
 	var root := VBoxContainer.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	add_child(root)
+	# 刘海 / 屏幕圆角：整个界面下移到安全区以下，顶栏两端不再被切（桌面留 0）。
+	SAFE_AREA.apply(root)
 
 	var top := HBoxContainer.new()
 	root.add_child(top)

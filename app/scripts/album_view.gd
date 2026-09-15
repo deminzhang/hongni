@@ -12,6 +12,7 @@ extends Control
 ## aggregates trunk members); api.current_device_bucket set means a device album.
 
 const ASSET_MENU := preload("res://scripts/asset_menu.gd")
+const SAFE_AREA := preload("res://scripts/safe_area.gd")
 
 const THUMB_SIZE := 140
 # Touch height of the top-bar 返回 (~48dp once the 600px base is scaled up).
@@ -98,6 +99,8 @@ func _build_ui() -> void:
 	var root := VBoxContainer.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	add_child(root)
+	# 刘海 / 屏幕圆角：整个界面下移到安全区以下，顶栏两端不再被切（桌面留 0）。
+	SAFE_AREA.apply(root)
 
 	# --- Top bar ---
 	var top := HBoxContainer.new()
