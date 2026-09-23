@@ -72,15 +72,31 @@ func (s *Store) Put(hash string, r io.Reader) error {
 	if _, err := os.Stat(p); err == nil {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	return writeFileAtomic(p, func(w io.Writer) error {
+		_, err := io.Copy(w, br)
+		return err
+	})
+}
+
+// writeFileAtomic writes a file through a uniquely named temp file next to it
+// and renames it over the destination. The unique name is not cosmetic: two
+// uploads of the same content can race to the same destination (the dedup check
+// is a lookup, not a lock), and a shared "<path>.tmp" would let their writes
+// interleave into one file. Renaming inside a directory is atomic, so a reader
+// — or a client that crashed mid-transfer — sees either nothing or the whole
+// file, never a truncated one. This matters most where writes are slow and
+// interrupted often: a network share (SMB/NAS).
+func writeFileAtomic(path string, write func(io.Writer) error) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := p + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, br); err != nil {
+	tmp := f.Name()
+	if err := write(f); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -89,7 +105,20 @@ func (s *Store) Put(hash string, r io.Reader) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, p)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		// A lost race is not a failure: the destination is derived from the
+		// content, so whoever got there first wrote these same bytes. Windows
+		// reports the collision as "Access is denied" (it will not replace a
+		// destination someone else has open), and rename is atomic, so anything
+		// sitting at the destination is a whole file — not a truncated one. Only
+		// a destination that is genuinely absent makes this a real error.
+		if _, statErr := os.Stat(path); statErr == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // Open returns a reader over the stored blob.
@@ -187,17 +216,9 @@ func (s *Store) EnsureThumb(hash string, r io.ReadSeeker) (bool, error) {
 		return false, nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(tp), 0o755); err != nil {
-		return false, err
-	}
-	f, err := os.Create(tp)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	thumb := scaleDown(img, 512)
-	if err := jpeg.Encode(f, thumb, &jpeg.Options{Quality: 82}); err != nil {
+	if err := writeFileAtomic(tp, func(w io.Writer) error {
+		return jpeg.Encode(w, scaleDown(img, 512), &jpeg.Options{Quality: 82})
+	}); err != nil {
 		return false, err
 	}
 	return true, nil

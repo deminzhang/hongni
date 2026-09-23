@@ -1106,8 +1106,10 @@ func extOf(name string) string {
 	return ""
 }
 
-// osCreateTemp creates a temp file inside dataDir, so it is on the same
-// filesystem as the blobs directory (safe for atomic rename).
+// osCreateTemp creates the upload's staging file inside dataDir rather than the
+// OS temp directory: a 4 GiB video has to land on the disk the operator chose.
+// The blob itself is written by blob.Put, which stages and renames inside
+// blobs/, so this file never needs to share a filesystem with it.
 func osCreateTemp(dataDir, pattern string) (*os.File, error) {
 	return os.CreateTemp(dataDir, pattern)
 }

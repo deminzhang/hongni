@@ -25,15 +25,26 @@ hongni/
 
 ### 数据目录
 
-`HONGNI_DATA_DIR`（默认 `./data`）：
+`HONGNI_DATA_DIR`，或启动参数 `-data <目录>`（默认 `./data`，相对当前工作目录）：
 
 ```
 data/
-├── hongni.db      # SQLite 索引（WAL）：资产 / 相册 / 身份
+├── hongni.db      # SQLite 索引（默认 WAL；网络盘改用 -journal TRUNCATE）
 ├── config.json    # 生成的共享 Bearer 令牌
 ├── blobs/<h0>/<h1>/<hash>   # 原始文件（内容寻址，无扩展名）
 └── thumbs/<h0>/<h1>/<hash>.jpg  # 缩略图（最长边 512px）
 ```
+
+### 数据目录放在网络盘（SMB / NAS）
+
+能放，但要按存储的性质选 journal 模式，并且守住"只有一个写入者"：
+
+- **`-journal`**：默认 `WAL` 只适合本地盘。WAL 把索引放在内存映射的 `hongni.db-shm` 里，靠文件锁在**同机**进程间互斥；SMB/NFS 不保证这一点，轻则 `disk I/O error`，重则库损坏。数据目录在网络共享上时用 `-journal TRUNCATE`（或 `DELETE`），走传统回滚日志。
+- **只有一个写入者**：同一时间只有一台机器跑 `hongni.exe` 指着这个目录（两台 = 必然损坏，SQLite 的锁不是为跨主机设计的）。同步盘/网盘客户端（OneDrive、Syncthing 之类）在后台"帮忙"同步同一个目录同理——把它指向的目录排除掉。
+- **iSCSI / 虚拟块设备**（NAS 给的是块设备而不是共享文件夹）对 SQLite 就是本地盘，这时保持默认 `WAL`，比滚回日志更快也更不容易撞锁。
+- **启动警告只认 UNC**（`\\nas\photos`）；映射盘符（`Z:\`）在这里看起来就是本地盘，`WAL` 的坑得自己避开。
+- **写入的原子性**：blob 与缩略图都是"同目录唯一临时文件 + rename"，所以网络中断/掉电最坏只会在磁盘上留一个 `.tmp`，不会留下半张照片或半个缩略图。但 SMB 客户端有写缓存，NAS 掉电仍可能丢掉"服务器已经应答"的最后几秒写入；要更硬的保证就把 `hongni.db` 留在本地盘。
+- **备份**：目录在 NAS 上不等于有备份。库和 blob 是两套东西，一致性备份要在停服后整份拷贝，或用存储侧快照。
 
 ### 存储模型（内容寻址 + 引用计数）
 
@@ -49,7 +60,7 @@ data/
 
 ### 配置与鉴权（两层：结点令牌 + 身份）
 
-- 环境变量：`HONGNI_DATA_DIR`、`HONGNI_ADDR`（默认 `:8354`）、`HONGNI_TOKEN`（可选）。
+- 启动参数：`-data <目录>`（默认 `./data`）、`-port <端口>`（默认 `8354`）、`-journal WAL|DELETE|TRUNCATE`（默认 `WAL`，网络盘见上）。环境变量 `HONGNI_DATA_DIR`、`HONGNI_ADDR`（默认 `:8354`）、`HONGNI_TOKEN`（可选）作为次一级来源——同名冲突时参数胜出，`HONGNI_ADDR` 里的主机名会被 `-port` 保留。
 - 令牌为空时从 `config.json` 读；仍无则 `crypto/rand` 生成 32 字节 hex 持久化并打印一次。
 - **第一层（结点令牌）**：`/health` 无需鉴权；`/api/v1/*` 全部要求 `Authorization: Bearer <token>`，`crypto/subtle.ConstantTimeCompare` 比对。它挡的是局域网里还没有令牌的设备。
 - **第二层（身份）**：`POST /api/v1/identity/login`（`{"identity","pin"}`）是唯一只要令牌就能调的数据路由，成功回 `{"session","identity","private_trunk_id","shared_trunk_id","registered"}`。其余数据路由再要求 `X-Hongni-Session: <session>`，服务端据此决定这次请求看得见哪些相册（见下「可见性」）。会话**只在服务端内存**（`sync.RWMutex` 保护的表），重启即全部失效——客户端拿存着的 身份 ID + PIN 自动重登，用户无感。
@@ -264,7 +275,10 @@ graph LR
 ## 运行与验证
 
 ```bash
-cd server && go run .          # 打印 HONGNI_TOKEN 一次
+cd server && go run .                    # 打印 HONGNI_TOKEN 一次；默认 ./data + :8354
+go run . -data D:\hongni-data -port 9000  # 指定数据目录与端口（HONGNI_DATA_DIR / HONGNI_ADDR 亦可，参数优先）
+go run . -data \\nas\photos\hongni -journal TRUNCATE   # 数据目录在网络盘上：必须换掉 WAL（见上）
+go build -o hongni.exe .                 # 二进制不会跟着源码走：改完 server 代码要重新 go build
 # 客户端：Godot 4.7 打开 app/，在设置里给每个结点填 名称/地址/令牌/身份 ID/PIN（可多个、可排序）
 #   身份 ID 首次在该服务器上注册时定下 PIN，之后要改就在设置页的「修改 PIN」（服务器校验旧 PIN）。升级后老结点会被判为未配置，先进设置页补两格。
 # Android 导出：项目设置启用 use_gradle_build，开启 hongni_plugin 插件

@@ -128,10 +128,14 @@ CREATE TABLE IF NOT EXISTS identities (
 );
 `
 
-// Open opens (creating if necessary) the SQLite database at path, enables WAL
-// and foreign keys, and applies the schema migration.
-func Open(path string) (*Store, error) {
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+// Open opens (creating if necessary) the SQLite database at path with the
+// given journal mode, enables foreign keys, and applies the schema migration.
+// The mode is a parameter because WAL — the default and the fastest — is only
+// sound on a local disk: it keeps its index in a memory-mapped "-shm" file that
+// network filesystems do not arbitrate between hosts, so a data directory on
+// SMB/NAS has to run a rollback journal (DELETE/TRUNCATE) instead.
+func Open(path, journal string) (*Store, error) {
+	dsn := path + "?_pragma=journal_mode(" + journal + ")&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
