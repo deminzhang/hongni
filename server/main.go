@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"log"
 	"net"
 	"net/http"
@@ -20,12 +22,19 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load()
+	cfg, err := config.Load(os.Args[1:])
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		log.Fatalf("config: %v", err)
 	}
 
-	st, err := store.Open(filepath.Join(cfg.DataDir, "hongni.db"))
+	if config.OnNetworkShare(cfg.DataDir) && cfg.Journal == config.JournalWAL {
+		log.Printf("警告：数据目录 %s 看起来在网络盘上，SQLite 的 WAL 在网络文件系统上不安全，改用 -journal TRUNCATE，并保证只有这一台机器写它", cfg.DataDir)
+	}
+
+	st, err := store.Open(filepath.Join(cfg.DataDir, "hongni.db"), cfg.Journal)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
@@ -70,7 +79,7 @@ func main() {
 }
 
 func registerZeroconf(addr string) (*zeroconf.Server, error) {
-	port := 8354
+	port := config.DefaultPort
 	if _, p, err := net.SplitHostPort(addr); err == nil {
 		if n, err := strconv.Atoi(p); err == nil {
 			port = n
